@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<selector
-  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
-    <item android:drawable="@drawable/ic_four_heads_connected" app:image_state1="true" />
-    <item android:drawable="@drawable/ic_four_heads_disconnected" app:image_state2="true" />
-    <item android:drawable="@drawable/ic_two_heads_connected" app:image_state3="true" />
-    <item android:drawable="@drawable/ic_two_heads_disconnected" app:image_state4="true" />
-</selector>

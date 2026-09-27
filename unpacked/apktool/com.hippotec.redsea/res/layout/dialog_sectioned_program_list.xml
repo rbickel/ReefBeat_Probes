@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="wrap_content"
-  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
-    <View android:layout_gravity="center" android:background="@drawable/rounded_background_grey_100dp" android:layout_width="32.0dip" android:layout_height="4.0dip" android:layout_marginTop="16.0dip" />
-    <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_14sp" android:textStyle="bold|italic" android:textColor="@color/generalBlack" android:id="@id/title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="33.0dip" android:text="@string/select_program_label" android:layout_marginStart="16.0dip" />
-    <androidx.recyclerview.widget.RecyclerView android:id="@id/recycler" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="20.0dip" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toBottomOf="@id/title" />
-</LinearLayout>

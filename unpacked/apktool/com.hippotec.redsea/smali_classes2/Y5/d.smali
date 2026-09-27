@@ -1,3 +1,0 @@
-.class public abstract LY5/d;
-.super Ljava/lang/Object;
-.source "SourceFile"

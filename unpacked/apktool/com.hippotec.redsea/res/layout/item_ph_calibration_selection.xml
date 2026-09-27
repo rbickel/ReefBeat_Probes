@@ -1,3 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<TextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/toolbar_apply_color" android:id="@id/tv_temp_item" android:tag="layout/item_ph_calibration_selection_0" android:background="?android:selectableItemBackground" android:paddingTop="@dimen/padding_22dp" android:paddingBottom="@dimen/padding_16dp" android:focusable="true" android:clickable="true" android:layout_width="fill_parent" android:layout_height="wrap_content" android:paddingStart="@dimen/padding_18dp"
-  xmlns:android="http://schemas.android.com/apk/res/android" />

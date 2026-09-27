@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <dimen name="edit_graph_blue_padding_top">7.0dip</dimen>
-    <dimen name="edit_graph_clouds_padding_top">8.0dip</dimen>
-    <dimen name="edit_graph_leds_layout_padding_top">9.0dip</dimen>
-    <dimen name="edit_graph_white_padding_top">7.0dip</dimen>
-    <dimen name="padding_25dp">25.0dip</dimen>
-    <dimen name="start_up_horse_top_margin">75.0dip</dimen>
-</resources>
