@@ -1,5 +1,6 @@
 """One ReefSense publishing application for Linux Python and Pico W MicroPython."""
 
+import asyncio
 import json
 import math
 import sys
@@ -13,7 +14,7 @@ MQTT_HOST = "192.168.50.177"
 MQTT_PORT = 1883
 PH_TOPIC = "reef/sump_ph/state"
 TEMPERATURE_TOPIC = "reef/tank_main_temp/state"
-TEMPERATURE_SENSOR_LABEL = "ds18b20"  # Existing payload label, not the actual hardware.
+TEMPERATURE_SENSOR_LABEL = "redsea_ph"
 AVAILABILITY_TOPIC = "reef/reef_probe/availability"
 MQTT_QOS = 0
 
@@ -193,6 +194,7 @@ async def run_bridge(settings, runtime, stop, once=False):
     calibration = Calibration(settings, marker) if settings.calibration_enabled else None
     if once and calibration is not None:
         raise ValueError("MQTT calibration requires continuous command processing, not --once.")
+    finished = False
     try:
         while not stop.is_set():
             stage = "prepare WiFi/time/MQTT"
@@ -217,6 +219,7 @@ async def run_bridge(settings, runtime, stop, once=False):
                     await publish_sample(settings, runtime, telemetry)
                     retry = settings.retry_min
                     if once:
+                        finished = True
                         return
                     stage = "wait for next poll"
                     delay = max(0, settings.poll_interval - runtime.elapsed(started))
@@ -234,12 +237,16 @@ async def run_bridge(settings, runtime, stop, once=False):
                 runtime.report("info", "Retrying in %.1fs" % retry)
                 await runtime.sleep(retry, stop)
                 retry = min(settings.retry_max, retry * 2)
+        finished = True
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        finished = True
+        raise
     finally:
         if calibration is not None and calibration.inhibits_measurements:
             runtime.report("warning", "Unresolved calibration/placement saved; restart requires recovery.")
         await mark_offline(settings, runtime)
         await close_runtime(runtime)
-        await indicate(runtime, "stopped")
+        await indicate(runtime, "stopped" if finished else "error")
 
 
 def main():

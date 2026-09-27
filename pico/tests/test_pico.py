@@ -1081,10 +1081,56 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         ph, temperature = json.loads(messages[1][1]), json.loads(messages[2][1])
         self.assertEqual(ph["value"], 8.2)
         self.assertEqual(temperature["value"], 25.4)
-        self.assertEqual(temperature["sensor"], "ds18b20")
+        self.assertEqual(temperature["sensor"], "redsea_ph")
         self.assertEqual(ph["ts"], temperature["ts"])
         self.assertEqual(self.hardware.ntp_calls, 1)
         self.assertEqual(self.hardware.connections[0].disconnects, 1)
+
+    async def test_fatal_payload_error_leaves_pico_led_on_in_calibration_mode(self):
+        self.settings.calibration_enabled = True
+        marker = SimpleNamespace(exists=Mock(return_value=False), set=Mock(), clear=Mock())
+        with (
+            patch("reef_calibration.PendingMarker", return_value=marker),
+            patch("reef_mqtt.state_messages", side_effect=TypeError("bad signature")),
+        ):
+            with self.assertRaisesRegex(TypeError, "bad signature"):
+                await reef_mqtt.run_bridge(self.settings, self.runtime, asyncio.Event())
+        self.assertEqual(self.hardware.led_changes[-1], 1)
+        self.assertEqual(self.hardware.connections[0].disconnects, 1)
+        messages = self.hardware.clients[0].publications
+        topics = [topic.decode() for topic, _, _, _ in messages]
+        self.assertIn(self.settings.calibration_state_topic, topics)
+        self.assertNotIn(self.settings.ph_topic, topics)
+        self.assertNotIn(self.settings.temperature_topic, topics)
+        self.assertEqual(messages[-1][:2], (self.settings.availability_topic.encode(), b"offline"))
+        marker.set.assert_not_called()
+
+    async def test_calibration_enabled_idle_loop_publishes_both_measurements(self):
+        self.settings.calibration_enabled = True
+        marker = SimpleNamespace(exists=Mock(return_value=False), set=Mock(), clear=Mock())
+        stop = asyncio.Event()
+
+        async def stop_after_poll(seconds, event, monitor_probe=False):
+            event.set()
+
+        with (
+            patch("reef_calibration.PendingMarker", return_value=marker),
+            patch.object(self.runtime, "sleep", side_effect=stop_after_poll),
+        ):
+            await reef_mqtt.run_bridge(self.settings, self.runtime, stop)
+        messages = self.hardware.clients[0].publications
+        readings = {topic.decode(): json.loads(payload)
+                    for topic, payload, _, _ in messages
+                    if topic.decode() in (self.settings.ph_topic, self.settings.temperature_topic)}
+        self.assertEqual(readings[self.settings.ph_topic]["value"], TELEMETRY["value"])
+        self.assertEqual(readings[self.settings.temperature_topic]["value"], TELEMETRY["temperature_value"])
+        self.assertEqual(readings[self.settings.temperature_topic]["sensor"], "redsea_ph")
+        self.assertTrue(any(topic.decode() == self.settings.availability_topic and payload == b"online"
+                            for topic, payload, _, _ in messages))
+        self.assertIn([1, 0, 1, 0], [self.hardware.led_changes[i:i + 4]
+                                    for i in range(len(self.hardware.led_changes) - 3)])
+        self.assertEqual(self.hardware.led_changes[-1], 0)
+        marker.set.assert_not_called()
 
     async def test_failed_publish_marks_disconnected_without_replay(self):
         await self.runtime.prepare()

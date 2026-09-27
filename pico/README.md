@@ -87,9 +87,10 @@ The original installation defaults are broker `192.168.50.177:1883`, probe
 - `reef/tank_main_temp/state`
 - `reef/reef_probe/availability`
 
-The default `ds18b20` temperature label deliberately preserves existing consumer
-compatibility; **the temperature comes from ReefSense, not a separate DS18B20**.
-Override `temperature_sensor` if appropriate. There is no automatic HA discovery.
+Both payloads default to the `redsea_ph` sensor label;
+**the temperature comes from ReefSense, not a separate DS18B20**.
+Override `temperature_sensor` with `ds18b20` only if a legacy consumer needs it.
+There is no automatic HA discovery.
 
 ## Copy and install on the board
 
@@ -152,6 +153,13 @@ Override `temperature_sensor` if appropriate. There is no automatic HA discovery
    Only after checking real behavior, copy [main.py](main.py) to the board as
    `main.py` **last**, enabling startup at boot. Ctrl-C attempts cleanup; removing
    or renaming the board's `main.py` disables startup.
+
+When updating the publisher, copy both `reef_mqtt.py` and `reef_mqtt_payload.py`
+from the same version, then restart the interpreter to discard cached imports.
+A `TypeError` about four versus five positional arguments in `publish_sample`
+means the payload function and its caller do not agree; it is not a BLE range
+error. The payload function accepts the optional fifth `temperature_sensor`
+argument. Preserve the board's credentials and any `calibration.pending` marker.
 
 ## Transport behavior and bounds
 
@@ -263,11 +271,14 @@ The Pico W's named `Pin("LED")` is used, not GPIO 25:
 | Two short flashes (100 ms on/off) | Both measurement states and `online` were sent to MQTT |
 | One short flash (100 ms) | Calibration progress indication |
 | One slow flash (400 ms) | Calibration operator-wait indication |
-| Solid on | A bridge error occurred; remains on during retry/recovery |
-| Off | Normal waiting between successful polls, startup, or stopped |
+| Solid on | A bridge error occurred; remains on during retry/recovery or after a fatal loop error |
+| Off | Normal waiting between successful polls, startup, or normal stop |
 
 The next successful publish clears the error indication with the double flash.
-Ctrl-C/shutdown turns the LED off. Since MQTT uses QoS 0, a success pattern means
+Ctrl-C/shutdown turns the LED off. A fatal loop error still prints its traceback
+and stops the application, but cleanup leaves the error LED on. Errors before
+the runtime/LED is initialized cannot be indicated this way.
+Since MQTT uses QoS 0, a success pattern means
 the transport accepted/sent the messages, not proof that Home Assistant processed
 them. A partial two-topic publish never triggers a success pattern. No separate
 permanent blink task is needed, and failed LED writes are logged without replaying

@@ -24,6 +24,6 @@ OVERRIDES = {
     # "status_led": True,  # Double flash = published; solid = error/retrying.
     # "host": "192.168.50.177",
     # "poll_interval": 60.0,
-    # "temperature_sensor": "ds18b20",  # Compatibility label, not the hardware.
+    # "temperature_sensor": "redsea_ph",  # Use ds18b20 only for legacy consumers.
     # "ntp_host": "192.168.50.1",  # Only if this really is your trusted NTP server.
 }

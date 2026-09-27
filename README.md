@@ -50,15 +50,15 @@ Defaults match the supplied existing Home Assistant state topics:
 | Topic | Payload fields |
 |---|---|
 | `reef/sump_ph/state` | `value`, `unit: "pH"`, `sensor: "redsea_ph"`, `id: "sump_ph"`, `ts` |
-| `reef/tank_main_temp/state` | `value`, `unit: "\u00b0C"`, `sensor: "ds18b20"`, `id: "tank_main_temp"`, `ts` |
+| `reef/tank_main_temp/state` | `value`, `unit: "\u00b0C"`, `sensor: "redsea_ph"`, `id: "tank_main_temp"`, `ts` |
 
 The payload is JSON, with numeric values and one shared UTC timestamp in
 `YYYY-MM-DDTHH:MM:SSZ` format. Both state messages are **QoS 0 and retained**.
 JSON `"\u00b0C"` decodes to the degree-C unit. The temperature comes from the
-**Red Sea probe**, not a DS18B20; `TEMPERATURE_SENSOR_LABEL = "ds18b20"` preserves
-your existing payload convention. Change it to `"redsea_temp"` if your consumers
-do not depend on that label. Topics, probe address, host, port and QoS are also
-constants near the top of the script.
+**Red Sea probe**, not a DS18B20. Both payloads default to `sensor: "redsea_ph"`;
+`TEMPERATURE_SENSOR_LABEL` controls the temperature label. Set it to `"ds18b20"`
+only if a legacy consumer requires that label. Topics, probe address, host, port
+and QoS are also constants near the top of the script.
 
 **Do not run this and an existing temperature publisher on the same topic.**
 Only one Pi/PC/Pico should connect to this probe at a time. Stop the bridge before

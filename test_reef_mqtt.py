@@ -31,7 +31,7 @@ class PayloadTests(unittest.TestCase):
                 "id": "sump_ph", "ts": STAMP,
             }),
             ("reef/tank_main_temp/state", {
-                "value": 26.7, "unit": "\u00b0C", "sensor": "ds18b20",
+                "value": 26.7, "unit": "\u00b0C", "sensor": "redsea_ph",
                 "id": "tank_main_temp", "ts": STAMP,
             }),
         ])
@@ -384,6 +384,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(json.loads(calls[1].args[1])["value"], SAMPLE["value"])
         self.assertEqual(json.loads(calls[2].args[1])["value"], SAMPLE["temperature_value"])
+        self.assertEqual(json.loads(calls[2].args[1])["sensor"], "redsea_ph")
         self.assertEqual([calls[i].args[1] for i in (0, 3, 4)], ["offline", "online", "offline"])
         runtime.close.assert_awaited_once()
         runtime.read.assert_awaited_once()
@@ -408,7 +409,31 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertTrue(runtime.close.await_count >= 1)
         self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],
-                         ["error", "stopped"])
+                         ["error", "error"])
+
+    async def test_unexpected_publish_error_surfaces_and_leaves_error_indicator(self):
+        runtime = self.runtime()
+        with patch("reef_mqtt.state_messages", side_effect=TypeError("bad signature")):
+            with self.assertRaisesRegex(TypeError, "bad signature"):
+                await app.run_bridge(app.Settings(), runtime, asyncio.Event())
+        runtime.read.assert_awaited_once()
+        runtime.close.assert_awaited_once()
+        runtime.sleep.assert_not_awaited()
+        runtime.indicate.assert_awaited_once_with("error")
+        self.assertTrue(all(
+            call.args == (app.AVAILABILITY_TOPIC, "offline")
+            for call in runtime.publish.await_args_list
+        ))
+
+    async def test_operator_interrupt_cleans_up_and_turns_indicator_off(self):
+        for interruption in (KeyboardInterrupt, asyncio.CancelledError):
+            with self.subTest(interruption=interruption):
+                runtime = self.runtime()
+                runtime.read.side_effect = interruption()
+                with self.assertRaises(interruption):
+                    await app.run_bridge(app.Settings(), runtime, asyncio.Event())
+                runtime.close.assert_awaited_once()
+                runtime.indicate.assert_awaited_once_with("stopped")
 
     async def test_common_retry_backoff_is_bounded_and_interruptible(self):
         runtime = self.runtime()
