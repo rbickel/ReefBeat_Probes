@@ -4,3 +4,5 @@ probe_logs/
 .env
 pico/config.py
 calibration.pending
+unpacked/
+ReefBeat_8.1.7_APKPure.xapk
