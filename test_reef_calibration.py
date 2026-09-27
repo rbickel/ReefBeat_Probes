@@ -47,6 +47,7 @@ class Runtime:
         self.history_unavailable = False
         self.fail = None
         self.telemetry = dict(TELEMETRY)
+        self.report = Mock()
 
     def ticks(self):
         return self.now
@@ -138,7 +139,7 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.calls[0][0], "/telemetry")
         self.assertEqual(self.runtime.published[0],
                          (self.cfg.availability_topic, "offline", True))
-        self.assertEqual(len(self.events("snapshot")), 3)
+        self.assertEqual(len(self.events("snapshot")), 4)
 
     async def test_full_two_point_sequence_requires_return_and_settle(self):
         await self.send("start")
@@ -272,6 +273,174 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.state, "recovery_required")
         self.assertEqual(self.writes(), before)
 
+    async def test_full_failed_status_survives_recovery_and_return(self):
+        await self.send("start")
+        await self.start_point("mid")
+        await self.complete_point()
+        await self.start_point("high")
+        self.runtime.now += 90
+        failed = {
+            "calibration_status": "fail_stability", "time_left": 90,
+            "stability_progress": 41, "firmware_extra": {"mv": -155, "samples": [1, 2, 3]},
+        }
+        self.runtime.statuses = [failed]
+        await self.controller.tick(self.runtime)
+        failure = self.controller.last_failure
+        self.assertEqual(failure["state"], "calibrating_high")
+        self.assertEqual(failure["elapsed_seconds"], 90)
+        self.assertEqual(failure["completed_points"], ["mid"])
+        self.assertEqual(failure["last_status"], failed)
+        self.assertEqual(failure["last_exchange"]["response"], failed)
+        self.assertEqual(failure["kind"], "probe_status")
+        self.assertEqual(self.controller.progress, failed)
+        self.assertEqual(self.events("failed")[-1]["data"], failure)
+        await self.send("recover")
+        await self.send("returned")
+        self.runtime.now += self.cfg.calibration_settle_seconds
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "idle")
+        self.assertEqual(self.controller.last_failure, failure)
+        retained = [json.loads(payload) for topic, payload, retain in self.runtime.published
+                    if topic == self.cfg.calibration_failure_topic and retain]
+        self.assertEqual(retained[-1], failure)
+
+    async def test_unknown_status_and_rejected_write_keep_full_firmware_response(self):
+        await self.send("start")
+        rejected = {"success": False, "message": "rejected", "firmware_code": 81,
+                    "extra": {"temperature": 24.9}}
+        original = self.runtime.request
+
+        async def request(path, payload=None, method=1):
+            if path == "/calibration-point-start":
+                raise ProbeRejected(rejected)
+            return await original(path, payload, method)
+
+        self.runtime.request = request
+        with self.assertRaises(ProbeRejected):
+            await self.start_point("mid")
+        self.assertEqual(self.controller.last_failure["last_exchange"]["response"], rejected)
+        self.assertEqual(self.controller.last_failure["last_exchange"]["path"],
+                         "/calibration-point-start")
+        self.assertEqual(self.controller.last_failure["point"], "mid")
+        self.assertEqual(self.controller.last_failure["state"], "awaiting_mid")
+        self.assertEqual(len([call for call in self.writes()
+                              if call[0] == "/calibration-enter"]), 1)
+
+    async def test_three_minute_high_point_does_not_fail_at_one_or_two_minutes(self):
+        await self.send("start")
+        await self.start_point("mid")
+        await self.complete_point()
+        await self.start_point("high")
+        for elapsed in range(0, 180, 3):
+            status = {"calibration_status": "in_progress", "time_left": 180 - elapsed,
+                      "stability_progress": elapsed / 180, "firmware_extra": "preserved"}
+            self.runtime.statuses = [status]
+            await self.controller.tick(self.runtime)
+            self.assertEqual(self.controller.state, "calibrating_high")
+            self.assertEqual(self.controller.progress, status)
+            self.runtime.now += 3
+        self.runtime.statuses = [{"calibration_status": "success", "time_left": 0,
+                                 "stability_progress": 1, "firmware_extra": "final"}]
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertEqual(self.controller.completed_points, ["mid", "high"])
+        self.assertEqual(self.events("point_completed")[-1]["data"]["firmware_extra"], "final")
+
+    async def test_mqtt_failure_after_status_response_preserves_evidence_for_reconnect(self):
+        await self.send("start")
+        await self.start_point("high" if self.controller.state == "awaiting_high" else "mid")
+        response = {"calibration_status": "in_progress", "time_left": 103,
+                    "stability_progress": "42", "extra": {"reason": "from firmware"}}
+        self.runtime.statuses = [response]
+        self.runtime.now += 77
+        publish = self.runtime.publish
+        self.runtime.publish = AsyncMock(side_effect=OSError("broker unavailable"))
+        with self.assertRaisesRegex(OSError, "broker unavailable") as caught:
+            await self.controller.tick(self.runtime)
+        self.controller.transport_failed(self.runtime, caught.exception, "calibration status")
+        first_failure = self.controller.last_failure
+        self.assertEqual(first_failure["elapsed_seconds"], 77)
+        self.assertEqual(first_failure["last_status"], response)
+        self.assertEqual(first_failure["last_exchange"]["response"], response)
+        self.assertTrue(self.controller.failure_pending)
+        self.controller.transport_failed(self.runtime, OSError("reconnect failed"))
+        self.assertIs(self.controller.last_failure, first_failure)
+        self.runtime.publish = publish
+        before = list(self.runtime.calls)
+        await self.controller.connected(self.runtime)
+        self.assertFalse(self.controller.failure_pending)
+        self.assertEqual(self.runtime.calls, before)
+        self.assertEqual(self.events("failed")[-1]["data"], first_failure)
+
+    async def test_large_firmware_snapshot_is_chunked_instead_of_aborting_session(self):
+        original = self.runtime.request
+
+        async def request(path, payload=None, method=1):
+            if path == "/config":
+                return {"long_firmware_field": "x" * 8000, "unknown": [1, None, True]}
+            return await original(path, payload, method)
+
+        self.runtime.request = request
+        await self.send("start")
+        self.assertEqual(self.controller.state, "awaiting_mid")
+        manifest = [json.loads(payload) for topic, payload, retain in self.runtime.published
+                    if topic == self.cfg.probe_diagnostics_topic + "/config" and retain][-1]
+        self.assertEqual(manifest["format"], "chunked-json")
+        for topic, payload, _ in self.runtime.published:
+            self.assertLessEqual(len(topic.encode()) + len(payload.encode()) + 8, 4096)
+        self.assertEqual(self.writes(), [])
+
+    async def test_all_known_failure_statuses_fail_closed_without_losing_fields(self):
+        for code in ("fail_stability", "fail_check_solution", "fail_value_error", "fail_process"):
+            with self.subTest(code=code):
+                self.controller = Calibration(self.cfg, MemoryMarker(), self.new_token)
+                await self.send("start")
+                await self.start_point("mid")
+                response = {"calibration_status": code, "stability_progress": "37",
+                            "time_left": 101, "firmware_reason": {"code": 42}}
+                self.runtime.statuses = [response]
+                await self.controller.tick(self.runtime)
+                self.assertEqual(self.controller.state, "recovery_required")
+                self.assertEqual(self.controller.last_failure["last_status"], response)
+                self.assertIn(code, self.controller.last_failure["message"])
+                self.assertTrue(self.controller.inhibits_measurements)
+
+    async def test_unknown_status_is_archived_before_validation_rejects_it(self):
+        await self.send("start")
+        await self.start_point("mid")
+        response = {"calibration_status": "new_firmware_status", "undocumented": [1, 2, 3]}
+        self.runtime.statuses = [response]
+        with self.assertRaisesRegex(ProbeError, "Unknown calibration state") as caught:
+            await self.controller.tick(self.runtime)
+        self.controller.transport_failed(self.runtime, caught.exception)
+        self.assertEqual(self.controller.last_failure["last_status"], response)
+        docs = [json.loads(payload) for topic, payload, retain in self.runtime.published
+                if topic == self.cfg.probe_diagnostics_topic + "/calibration-status/mid" and retain]
+        self.assertEqual(docs[-1]["response"], response)
+
+    async def test_full_failure_is_not_cleared_by_a_new_controller(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.statuses = [{"calibration_status": "fail_process"}]
+        await self.controller.tick(self.runtime)
+        before = [row for row in self.runtime.published if row[0] == self.cfg.calibration_failure_topic]
+        self.controller = Calibration(self.cfg, self.marker, self.new_token)
+        await self.controller.connected(self.runtime)
+        after = [row for row in self.runtime.published if row[0] == self.cfg.calibration_failure_topic]
+        self.assertEqual(after, before)
+        self.assertEqual(self.controller.state, "recovery_required")
+
+    async def test_large_failed_status_keeps_control_state_within_packet_limit(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.statuses = [{"calibration_status": "fail_process", "detail": "\u00e9" * 10000}]
+        await self.controller.tick(self.runtime)
+        state = self.controller.snapshot(self.runtime)
+        self.assertLessEqual(len(json.dumps(state).encode()), 3072)
+        self.assertEqual(state["progress"]["details_topic"],
+                         self.cfg.probe_diagnostics_topic + "/calibration-status/mid")
+        self.assertEqual(self.controller.last_failure["last_status"]["detail"], "\u00e9" * 10000)
+
     async def test_cancel_before_first_point_needs_return_but_no_ble_write(self):
         await self.send("start")
         await self.send("cancel")
@@ -327,7 +496,7 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.statuses = [{"calibration_status": "surprise"}]
         with self.assertRaisesRegex(ProbeError, "Unknown calibration state"):
             await self.controller.tick(self.runtime)
-        self.controller.transport_failed(ProbeError("unknown state"))
+        self.controller.transport_failed(self.runtime, ProbeError("unknown state"))
         self.assertEqual(self.controller.state, "recovery_required")
         self.assertTrue(self.marker.pending)
 

@@ -953,6 +953,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             requests.append((raw[0], path, payload))
             if path == "/telemetry":
                 result = TELEMETRY
+            elif path == "/firmware":
+                result = {"version": "mock-1.0", "unknown_firmware_field": True}
             elif path == "/config":
                 result = {"mock_configuration": True}
             elif path == "/calibration-log":
@@ -992,6 +994,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(calibration.seen_progress)
         self.assertEqual(requests, [
             (GET, "/telemetry", None),
+            (GET, "/firmware", None),
             (GET, "/config", None),
             (GET, "/calibration-log", {"point": "mid"}),
             (GET, "/calibration-log", {"point": "high"}),
@@ -1072,7 +1075,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         messages = self.hardware.clients[0].publications
         self.assertEqual([topic.decode() for topic, _, _, _ in messages], [
             self.settings.availability_topic, self.settings.ph_topic,
-            self.settings.temperature_topic, self.settings.availability_topic,
+            self.settings.temperature_topic, self.settings.probe_diagnostics_topic + "/telemetry",
+            self.settings.availability_topic,
             self.settings.availability_topic,
         ])
         self.assertEqual(messages[0][1], b"offline")

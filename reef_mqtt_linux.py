@@ -362,6 +362,14 @@ class Runtime:
     def mqtt_connected(self) -> bool:
         return self.publisher.is_connected()
 
+    def diagnostic_context(self) -> dict[str, object]:
+        return {
+            "platform": "linux", "mqtt_connected": self.mqtt_connected(),
+            "ble_connected": bool(self.client and self.client.is_connected),
+            "ble_stream_failed": self.probe.broken if self.probe is not None else None,
+            "mtu": self.probe.mtu if self.probe is not None else None,
+        }
+
     @staticmethod
     def timestamp() -> str:
         return utc_timestamp()

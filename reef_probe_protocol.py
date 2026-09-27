@@ -1,5 +1,6 @@
 """Shared ReefSense wire protocol for CPython and MicroPython; no hardware I/O."""
 
+import binascii
 import json
 import math
 import struct
@@ -13,13 +14,15 @@ MAX_RESPONSE = 65536
 
 
 class ProbeError(Exception):
-    pass
+    def __init__(self, message, response=None, raw_hex=None):
+        self.response = response
+        self.raw_hex = raw_hex
+        super().__init__(message)
 
 
 class ProbeRejected(ProbeError):
     def __init__(self, response):
-        self.response = response
-        super().__init__("Probe rejected the request: %s" % response.get("message", response))
+        super().__init__("Probe rejected the request: %s" % response.get("message", response), response)
 
 
 def _finite_numbers(value):
@@ -55,17 +58,18 @@ def request_packets(method, path, payload=None, mtu=512):
 
 def unpack_packet(raw):
     if len(raw) < 5:
-        raise ProbeError("Notification shorter than five-byte header")
+        raise ProbeError("Notification shorter than five-byte header", raw_hex=binascii.hexlify(raw).decode())
     length, remaining, kind = struct.unpack("<HHB", raw[:5])
     if length != len(raw) - 2:
-        raise ProbeError("Packet length mismatch: header=%s, actual=%s" % (length, len(raw) - 2))
+        raise ProbeError("Packet length mismatch: header=%s, actual=%s" % (length, len(raw) - 2),
+                         raw_hex=binascii.hexlify(raw).decode())
     if kind == ERROR:
         code = raw[5] if len(raw) > 5 else None
-        raise ProbeError("Probe protocol error: code=%s" % code)
+        raise ProbeError("Probe protocol error: code=%s" % code, raw_hex=binascii.hexlify(raw).decode())
     if kind not in (REST, ACK):
-        raise ProbeError("Unknown packet type %s" % kind)
+        raise ProbeError("Unknown packet type %s" % kind, raw_hex=binascii.hexlify(raw).decode())
     if kind == ACK and len(raw) != 5:
-        raise ProbeError("Unexpected ACK payload; inspect the raw log.")
+        raise ProbeError("Unexpected ACK payload; inspect the raw log.", raw_hex=binascii.hexlify(raw).decode())
     return remaining, kind, raw[5:]
 
 
@@ -87,16 +91,16 @@ class Response:
 def decode_response(raw):
     start, end = raw.find(b"{"), raw.rfind(b"}")
     if start < 0 or end < start:
-        raise ProbeError("Response has no JSON object; inspect the raw log.")
+        raise ProbeError("Response has no JSON object; inspect the raw log.", raw_hex=binascii.hexlify(raw).decode())
     try:
         result = json.loads(raw[start:end + 1].decode("utf-8"))
         _finite_numbers(result)
     except (UnicodeError, ValueError) as exc:
-        raise ProbeError("Invalid response JSON: %s" % exc)
+        raise ProbeError("Invalid response JSON: %s" % exc, raw_hex=binascii.hexlify(raw).decode())
     if not isinstance(result, dict):
         raise ProbeError("Expected a JSON object.")
     if "success" in result and not isinstance(result["success"], bool):
-        raise ProbeError("Response 'success' field is not a boolean.")
+        raise ProbeError("Response 'success' field is not a boolean.", result)
     if result.get("success") is False:
         raise ProbeRejected(result)
     return result

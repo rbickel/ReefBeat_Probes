@@ -142,13 +142,15 @@ class MqttTests(unittest.TestCase):
         self.publish_sample()
         calls = self.client.publish.call_args_list
         self.assertEqual([c.args[0] for c in calls],
-                         [bridge.PH_TOPIC, bridge.TEMPERATURE_TOPIC, bridge.AVAILABILITY_TOPIC])
+                         [bridge.PH_TOPIC, bridge.TEMPERATURE_TOPIC,
+                          self.settings.probe_diagnostics_topic + "/telemetry", bridge.AVAILABILITY_TOPIC])
         for call in calls:
             self.assertEqual(call.kwargs, {"qos": 0, "retain": True})
         self.assertEqual(json.loads(calls[0].args[1]), state_messages(SAMPLE, STAMP)[0][1])
         self.assertEqual(json.loads(calls[1].args[1])["unit"], "\u00b0C")
-        self.assertEqual(calls[2].args[1], "online")
-        self.assertEqual(self.info.wait_for_publish.call_count, 3)
+        self.assertEqual(json.loads(calls[2].args[1])["response"], SAMPLE)
+        self.assertEqual(calls[3].args[1], "online")
+        self.assertEqual(self.info.wait_for_publish.call_count, 4)
 
     def test_failure_does_not_announce_online(self):
         self.publisher.connect()
@@ -380,12 +382,14 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         calls = runtime.publish.await_args_list
         self.assertEqual([call.args[0] for call in calls], [
             app.AVAILABILITY_TOPIC, app.PH_TOPIC, app.TEMPERATURE_TOPIC,
+            app.Settings().probe_diagnostics_topic + "/telemetry",
             app.AVAILABILITY_TOPIC, app.AVAILABILITY_TOPIC,
         ])
         self.assertEqual(json.loads(calls[1].args[1])["value"], SAMPLE["value"])
         self.assertEqual(json.loads(calls[2].args[1])["value"], SAMPLE["temperature_value"])
         self.assertEqual(json.loads(calls[2].args[1])["sensor"], "redsea_ph")
-        self.assertEqual([calls[i].args[1] for i in (0, 3, 4)], ["offline", "online", "offline"])
+        self.assertEqual(json.loads(calls[3].args[1])["response"], SAMPLE)
+        self.assertEqual([calls[i].args[1] for i in (0, 4, 5)], ["offline", "online", "offline"])
         runtime.close.assert_awaited_once()
         runtime.read.assert_awaited_once()
         self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],

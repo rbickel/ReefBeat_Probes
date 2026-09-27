@@ -186,6 +186,15 @@ class Runtime:
     def mqtt_connected(self):
         return bool(self.wlan.isconnected() and self.publisher and self.publisher.connected)
 
+    def diagnostic_context(self):
+        return {
+            "platform": "pico", "wifi_connected": self.wlan.isconnected(),
+            "mqtt_connected": self.mqtt_connected(),
+            "ble_connected": bool(self.connection and self.connection.is_connected()),
+            "ble_subscribed": self._subscribed, "ble_stream_failed": self._stream_failed,
+            "mtu": self._mtu, "notifications_received": self.queue.received if self.queue is not None else 0,
+        }
+
     def timestamp(self):
         if not self._time_synced:
             raise ValueError("RTC has not been synchronized by NTP")
@@ -387,6 +396,7 @@ class Runtime:
             if remaining <= 0:
                 raise asyncio.TimeoutError()
             if self.publisher is not None:
+                progress["stage"] = "checking MQTT before BLE write"
                 self._ping(timeout=remaining)
             remaining = self.settings.request_timeout - self.elapsed(progress["started"])
             if remaining <= 0:
@@ -398,7 +408,7 @@ class Runtime:
                     remaining, progress, path[1:],
                 )
                 if method == POST and result.get("success") is not True:
-                    raise ProbeError("POST response must contain success=true")
+                    raise ProbeError("POST response must contain success=true", result)
                 return result
             except ProbeRejected:
                 # Only a complete, well-framed rejection leaves the stream usable.

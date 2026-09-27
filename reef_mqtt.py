@@ -6,6 +6,7 @@ import math
 import sys
 
 from reef_mqtt_payload import state_messages, validate_topics
+from reef_mqtt_diagnostics import publish_document
 
 # Shared installation defaults. Credentials are loaded by the platform adapter.
 POLL_INTERVAL_SECONDS = 60.0
@@ -37,6 +38,8 @@ class Settings:
             "calibration_command_topic": "reef/sump_ph/calibration/command",
             "calibration_state_topic": "reef/sump_ph/calibration/state",
             "calibration_event_topic": "reef/sump_ph/calibration/event",
+            "calibration_failure_topic": "reef/sump_ph/calibration/failure",
+            "probe_diagnostics_topic": "reef/reef_probe/diagnostics",
             "calibration_timeout": 360.0, "calibration_wait_timeout": 900.0,
             "calibration_poll_interval": 3.0, "calibration_command_ttl": 120,
             "calibration_settle_seconds": 30.0,
@@ -92,13 +95,21 @@ class Settings:
             raise ValueError("Availability topic must not overwrite a sensor state")
         validate_topics(self.ph_topic, self.temperature_topic, self.temperature_sensor)
         topics = [self.ph_topic, self.temperature_topic, self.availability_topic]
-        for key in ("calibration_command_topic", "calibration_state_topic", "calibration_event_topic"):
+        for key in ("calibration_command_topic", "calibration_state_topic", "calibration_event_topic",
+                    "calibration_failure_topic", "probe_diagnostics_topic"):
             topic = getattr(self, key)
             if not isinstance(topic, str) or not topic or any(c in topic for c in ("+", "#", "\0")):
                 raise ValueError("Invalid " + key)
             topics.append(topic)
         if len(set(topics)) != len(topics):
             raise ValueError("Calibration, measurement and availability topics must be distinct")
+        diagnostic_roots = (self.probe_diagnostics_topic, self.calibration_failure_topic,
+                            self.calibration_event_topic)
+        for root in diagnostic_roots:
+            if len(root.encode("utf-8")) > 400:
+                raise ValueError("Diagnostic topic exceeds 400 bytes")
+            if any(topic != root and topic.startswith(root + "/") for topic in topics):
+                raise ValueError("Diagnostic topic trees must not overlap other topics")
         if not isinstance(self.calibration_marker_path, str) or not self.calibration_marker_path:
             raise ValueError("calibration_marker_path must be nonempty")
         if require_credentials and (not self.username or not self.password):
@@ -124,6 +135,10 @@ async def publish_sample(settings, runtime, telemetry):
     )
     for topic, payload in messages:
         await runtime.publish(topic, json.dumps(payload))
+    await publish_document(runtime, settings.probe_diagnostics_topic + "/telemetry", {
+        "ts": messages[0][1]["ts"], "method": "GET", "path": "/telemetry",
+        "state": "idle", "response": telemetry,
+    })
     await runtime.publish(settings.availability_topic, "online")
     await indicate(runtime, "published")
     runtime.report("info", "Sent probe sample: pH=%s, temperature=%s C" % (
@@ -201,6 +216,8 @@ async def run_bridge(settings, runtime, stop, once=False):
             try:
                 await runtime.prepare()
                 await mark_offline(settings, runtime)
+                if calibration is not None and calibration.failure_pending:
+                    await calibration.announce(runtime)
                 stage = "connect and subscribe BLE"
                 await runtime.connect_probe()
                 runtime.report("info", "Poll interval: %.1fs" % settings.poll_interval)
@@ -226,7 +243,13 @@ async def run_bridge(settings, runtime, stop, once=False):
                     await runtime.sleep(delay, stop, monitor_probe=True)
             except runtime.errors as exc:
                 if calibration is not None:
-                    calibration.transport_failed(exc)
+                    calibration.transport_failed(runtime, exc, stage)
+                    if runtime.mqtt_connected():
+                        try:
+                            await calibration.announce(runtime)
+                        except runtime.errors as diagnostic_error:
+                            runtime.report("error", "Failure diagnostics pending MQTT reconnect: %s"
+                                           % describe_error(diagnostic_error))
                 runtime.report("error", "Bridge cycle incomplete during %s; "
                                "no fabricated replacement: %s" % (stage, describe_error(exc)))
                 await indicate(runtime, "error")

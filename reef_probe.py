@@ -204,7 +204,7 @@ class Probe:
                                 self.broken = False
                                 raise
                             if method == POST and result.get("success") is not True:
-                                raise ProbeError("Calibration command lacks explicit success=true.")
+                                raise ProbeError("Calibration command lacks explicit success=true.", result)
                             self.trace.record("response", path=path, data=result)
                             self.broken = False
                             return result

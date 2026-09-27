@@ -304,6 +304,74 @@ These results confirm direct BLE access on this unit without a hub or cloud
 request in the test session; calibration and accuracy still need reference-buffer
 validation. All 41 offline regression tests passed after the live protocol fix.
 
+## Firmware upgrade path (APK analysis only)
+
+**No firmware image was downloaded and no FOTA command was sent. There is still
+no firmware updater in this project.** The ReefBeat 8.1.7 APK does contain a
+dedicated ReefSense probe update path, but it is not a normal POST to the
+probe's `/firmware` resource.
+
+For a pH probe, the app maps the sensor to `reef-sense-ph` and defaults to board
+`esp32` and framework `i`. While signed in, it:
+
+1. sends an authenticated GET to
+   `https://cloud.reef-beat.com/firmware/api/reef-sense-ph/latest?board=esp32&framework=i`;
+2. compares that version with the installed version;
+3. downloads the raw image from
+   `https://cloud.reef-beat.com/firmware/api/reef-sense-ph/download?framework=i`,
+   adding `x-ESP32-version` with the installed version and
+   `x-FW-desired-version` with the selected version; and
+4. passes the returned bytes to the proprietary BLE SDK.
+
+Both live endpoints returned HTTP 401 without the app's account authorization
+on 2026-09-27. A manual tool must not scrape, embed, log or commit a ReefBeat
+access token. The app code does not provide an unauthenticated firmware catalog.
+
+The BLE manager connects with a 30-second timeout, synchronizes the probe using
+POST `/time`, and then starts the raw FOTA operation. With the app's requested
+MTU 512, each data packet carries up to 504 image bytes. FOTA packets use the
+same five-byte little-endian envelope seen by the diagnostic client:
+
+- the start packet has type 2 and contains the image MD5 plus its 32-bit size;
+- data packets have type 3 and descending indices from `N-1` to zero;
+- the terminal index-zero packet is written once with the data stream and then
+  sent again while waiting for the probe's completion response.
+
+The start and terminal commands require probe responses; intermediate chunks
+complete after their GATT write succeeds. On success the app optionally
+disconnects, waits ten seconds, and reports completion. The traced FOTA manager
+does **not** reconnect and read `/firmware` to prove that the expected version
+booted. The Android layer visibly supplies MD5 for transfer integrity but no
+detached firmware signature check; the probe bootloader may perform additional
+checks that are not visible in the app. No interrupted-transfer resume,
+bootloader recovery, downgrade or unbrick path was found.
+
+### Safe recommendation
+
+Use the official ReefBeat firmware screen first. Stop this bridge and every
+other BLE client, keep the ReefSense USB-C power stable, remain near the probe,
+and do not disconnect it until ReefBeat reports completion and the probe's LED
+cycle finishes. Leave it alone for at least the app's ten-second reboot delay,
+then independently verify the installed version:
+
+```bash
+.venv/bin/python reef_probe.py read \
+  --address AA:BB:CC:DD:EE:FF --samples 1
+```
+
+The supplied probe currently reports `1.1.2`; this repository cannot determine
+the current cloud version without an authenticated ReefBeat session. If the app
+offers no update, do not flash merely because the probe is recent.
+
+A manual CPython updater is feasible, but it should not be enabled until one
+official update has been observed end to end and its exact target, image size,
+hash, BLE responses, reboot behavior and recovery options have been recorded.
+Any future updater should be a separate, explicit command using a locally
+supplied image, require target/version/hash confirmation and stable power, never
+auto-retry a partial flash, and reconnect to verify `/firmware` before claiming
+success. Pico flashing should remain out of scope until the Linux path has been
+validated on replaceable hardware.
+
 ## MQTT-guided calibration (opt-in, experimental)
 
 **Implementation and offline tests only: no real calibration has been executed
@@ -746,3 +814,7 @@ The shared settings are accepted on Linux, but its adapter does not drive GPIO.
 - [Calibration point payload](unpacked/apktool/com.hippotec.redsea/smali/U0/f$a.smali)
 - [Calibration argument construction](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/activities/devices/control/calibration/base/BaseControlProbeCalibrationActivity.smali)
 - [Calibration state names](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/model/control/ControlProbeCalibrationStatus$Companion.smali)
+- [ReefSense firmware cloud flow](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/app_services/Fota/firmwaredownload/FirmwareFromCloudDownloadAppService.smali)
+- [Probe firmware update activity](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/activities/settings/SensorFirmwareUpdateActivity.smali)
+- [BLE firmware update orchestration](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/managers/BleFirmwareUpdateManager.smali)
+- [FOTA packet construction](unpacked/apktool/com.hippotec.redsea/smali/O0/a.smali)
