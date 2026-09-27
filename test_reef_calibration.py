@@ -348,7 +348,7 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mqtt_failure_after_status_response_preserves_evidence_for_reconnect(self):
         await self.send("start")
-        await self.start_point("high" if self.controller.state == "awaiting_high" else "mid")
+        await self.start_point("mid")
         response = {"calibration_status": "in_progress", "time_left": 103,
                     "stability_progress": "42", "extra": {"reason": "from firmware"}}
         self.runtime.statuses = [response]
@@ -440,6 +440,41 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["progress"]["details_topic"],
                          self.cfg.probe_diagnostics_topic + "/calibration-status/mid")
         self.assertEqual(self.controller.last_failure["last_status"]["detail"], "\u00e9" * 10000)
+
+    async def test_buffer_telemetry_contains_unknown_fields_without_aquarium_publication(self):
+        await self.send("start")
+        self.runtime.telemetry.update(raw_ph=7.1, compensated_ph=7.11,
+                                      temperature_value=24.4, firmware_extra={"raw_adc": 123})
+        await self.start_point("mid")
+        self.runtime.statuses = [{"calibration_status": "in_progress", "stability_progress": "18"}]
+        self.runtime.telemetry["status"] = "calibration"
+        await self.controller.tick(self.runtime)
+        docs = [json.loads(payload) for topic, payload, retain in self.runtime.published
+                if topic == self.cfg.probe_diagnostics_topic + "/telemetry/mid" and retain]
+        self.assertEqual(docs[-1]["response"], self.runtime.telemetry)
+        self.assertFalse(any(topic in (self.cfg.ph_topic, self.cfg.temperature_topic)
+                             for topic, _, _ in self.runtime.published))
+
+    async def test_unsupported_buffer_telemetry_is_explicit_and_not_retried_each_poll(self):
+        await self.send("start")
+        original = self.runtime.request
+        attempts = []
+
+        async def request(path, payload=None, method=1):
+            if path == "/telemetry":
+                attempts.append(path)
+                raise ProbeRejected({"success": False, "message": "unavailable", "code": 12})
+            return await original(path, payload, method)
+
+        self.runtime.request = request
+        await self.start_point("mid")
+        for _ in range(3):
+            self.runtime.statuses = [{"calibration_status": "in_progress"}]
+            await self.controller.tick(self.runtime)
+            self.runtime.now += 3
+        self.assertEqual(attempts, ["/telemetry"])
+        self.assertEqual(self.controller.state, "calibrating_mid")
+        self.assertEqual(self.events("diagnostic_unavailable")[-1]["data"]["code"], 12)
 
     async def test_cancel_before_first_point_needs_return_but_no_ble_write(self):
         await self.send("start")

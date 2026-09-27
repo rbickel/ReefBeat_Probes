@@ -998,10 +998,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             (GET, "/config", None),
             (GET, "/calibration-log", {"point": "mid"}),
             (GET, "/calibration-log", {"point": "high"}),
+            (GET, "/telemetry", None),
             (POST, "/calibration-enter", {"time": self.runtime.epoch()}),
             (POST, "/calibration-point-start",
              {"point": "mid", "solution_ph": 7.0, "solution_rated_temp": 25}),
             (GET, "/calibration-status", None),
+            (GET, "/telemetry", None),
         ])
         marker.set.assert_called_once()
         marker.clear.assert_not_called()
@@ -1146,6 +1148,19 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.prepare()
         await self.runtime.publish("test/state", "fresh")
         self.assertEqual(self.hardware.clients[-1].publications, [(b"test/state", b"fresh", True, 0)])
+
+    async def test_large_firmware_diagnostic_fits_real_adapter_packet_limit(self):
+        from reef_mqtt_diagnostics import publish_document
+        await self.runtime.prepare()
+        document = {"response": {"future_firmware_data": "\u00b0" * 5000}}
+        await publish_document(self.runtime, "reef/test/diagnostics", document)
+        messages = self.hardware.clients[0].publications
+        self.assertGreater(len(messages), 2)
+        self.assertEqual(json.loads(messages[-1][1])["format"], "chunked-json")
+        self.assertTrue(self.runtime.mqtt_connected())
+        self.assertTrue(all(retain for _, _, retain, _ in messages))
+        self.assertTrue(all(len(topic) + len(payload) + 8 <= 4096
+                            for topic, payload, _, _ in messages))
 
     async def test_sleep_repeatedly_pings_and_monitors_ble(self):
         await self.runtime.prepare()

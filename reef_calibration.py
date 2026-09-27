@@ -82,6 +82,8 @@ class Calibration:
         self.point_requested_at = None
         self.last_exchange = None
         self.last_status = None
+        self.last_telemetry = None
+        self.buffer_telemetry_supported = True
         self.last_failure = None
         self.failure_pending = False
         if self.marker.exists():
@@ -133,7 +135,7 @@ class Calibration:
     def response_topic(self, path, payload=None):
         topic = self.cfg.probe_diagnostics_topic + path
         point = payload.get("point") if payload is not None else self.point
-        if path in ("/calibration-status", "/calibration-point-start", "/calibration-log") and point:
+        if path in ("/telemetry", "/calibration-status", "/calibration-point-start", "/calibration-log") and point:
             topic += "/" + point
         return topic
 
@@ -165,6 +167,7 @@ class Calibration:
             "command_id": self.last_command_id, "completed_points": list(self.completed_points),
             "elapsed_seconds": runtime.elapsed(started) if started is not None else None,
             "last_exchange": self.last_exchange, "last_status": self.last_status,
+            "last_telemetry": self.last_telemetry,
             "limits": {
                 "calibration_timeout": self.cfg.calibration_timeout,
                 "calibration_poll_interval": self.cfg.calibration_poll_interval,
@@ -206,8 +209,20 @@ class Calibration:
         if path == "/calibration-status":
             self.last_status = result
             self.progress = result
+        if path == "/telemetry":
+            self.last_telemetry = exchange
         await publish_document(runtime, topic, exchange)
         return result
+
+    async def _sample_buffer(self, runtime):
+        if not self.buffer_telemetry_supported:
+            return
+        try:
+            await self._request(runtime, "/telemetry")
+        except ProbeRejected as error:
+            self.buffer_telemetry_supported = False
+            await self.event(runtime, "diagnostic_unavailable", self.last_command_id,
+                             str(error), path="/telemetry", data=error.response)
 
     async def _set_state(self, runtime, state, detail):
         self.state, self.detail = state, detail
@@ -345,6 +360,7 @@ class Calibration:
             self.completed_points = []
             self.point = self.point_started = self.point_requested_at = None
             self.last_status = None
+            self.last_telemetry = None
             self.outcome = None
             await runtime.publish(self.cfg.availability_topic, "offline")
             telemetry = await self._request(runtime, "/telemetry")
@@ -370,6 +386,8 @@ class Calibration:
             self.point_requested_at = runtime.ticks()
             self.point_started = None
             self.last_status = None
+            self.buffer_telemetry_supported = True
+            await self._sample_buffer(runtime)
             if point == "mid":
                 self.enter_attempted = True
                 await self._post(runtime, "/calibration-enter", {"time": runtime.epoch()})
@@ -434,7 +452,9 @@ class Calibration:
             elif status == "success" and self.seen_progress:
                 point = self.state[len("calibrating_"):]
                 self.completed_points.append(point)
-                await self.event(runtime, "point_completed", self.last_command_id, point=point, data=result)
+                await self._sample_buffer(runtime)
+                await self.event(runtime, "point_completed", self.last_command_id,
+                                 point=point, data=result, telemetry=self.last_telemetry)
                 if point == "mid":
                     await self._set_state(runtime, "awaiting_high", "Rinse and place probe in high buffer; then point_ready.")
                 else:
@@ -445,6 +465,7 @@ class Calibration:
                 return
             elif status not in ("idle", "success"):
                 raise ProbeError("Unknown calibration state: " + status)
+            await self._sample_buffer(runtime)
             await self.event(runtime, "progress", self.last_command_id,
                              calibration_status=status, time_left=result.get("time_left"), data=result)
             await self.announce(runtime)
@@ -472,6 +493,9 @@ class Calibration:
         self.detail = message
         self.nonce = self.new_token()
         await runtime.publish(self.cfg.availability_topic, "offline")
+        if kind == "probe_status":
+            await self._sample_buffer(runtime)
+            self.last_failure["last_telemetry"] = self.last_telemetry
         await runtime.indicate("error")
         await self.announce(runtime)
 

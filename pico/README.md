@@ -6,6 +6,7 @@ only a platform adapter, not a second publisher application.
 ```text
 reef_mqtt.py                 shared Settings and run_bridge policy loop
 reef_mqtt_payload.py         shared MQTT payload formatting
+reef_mqtt_diagnostics.py     full JSON diagnostics and bounded MQTT chunking
 reef_calibration.py          shared opt-in staged calibration controller
 reef_probe_protocol.py       shared ReefSense framing/parser/validation
   |
@@ -65,6 +66,8 @@ the exact topic, never a wildcard. The defaults are:
 | `calibration_command_topic` | `reef/sump_ph/calibration/command` |
 | `calibration_state_topic` | `reef/sump_ph/calibration/state` |
 | `calibration_event_topic` | `reef/sump_ph/calibration/event` |
+| `calibration_failure_topic` | `reef/sump_ph/calibration/failure` |
+| `probe_diagnostics_topic` | `reef/reef_probe/diagnostics` |
 | `calibration_timeout` | 360 seconds |
 | `calibration_wait_timeout` | 900 seconds |
 | `calibration_poll_interval` | 3 seconds |
@@ -132,6 +135,7 @@ There is no automatic HA discovery.
    | --- | --- |
    | [../reef_mqtt.py](../reef_mqtt.py) | `reef_mqtt.py` |
    | [../reef_mqtt_payload.py](../reef_mqtt_payload.py) | `reef_mqtt_payload.py` |
+   | [../reef_mqtt_diagnostics.py](../reef_mqtt_diagnostics.py) | `reef_mqtt_diagnostics.py` |
    | [../reef_calibration.py](../reef_calibration.py) | `reef_calibration.py` |
    | [../reef_probe_protocol.py](../reef_probe_protocol.py) | `reef_probe_protocol.py` |
    | [pico_runtime.py](pico_runtime.py) | `pico_runtime.py` |
@@ -153,6 +157,21 @@ There is no automatic HA discovery.
    Only after checking real behavior, copy [main.py](main.py) to the board as
    `main.py` **last**, enabling startup at boot. Ctrl-C attempts cleanup; removing
    or renaming the board's `main.py` disables startup.
+
+For the expanded calibration diagnostics, update `reef_mqtt.py`,
+`reef_calibration.py`, `reef_probe_protocol.py`, and `pico_runtime.py` together and
+add **`reef_mqtt_diagnostics.py`** to the board root. Keep the board's real
+`config.py`, `main.py`, and any pending calibration marker. Restart the interpreter
+to discard cached imports; changing only the files on the computer is insufficient.
+
+Calibration failures now remain available on retained
+`reef/sump_ph/calibration/failure` after recovery. Subscribe to
+`reef/reef_probe/diagnostics/#` for full firmware/config/history, write responses,
+status (including `stability_progress`), and diagnostic buffer telemetry.
+No buffer readings are sent to aquarium state topics. Large documents use
+bounded, lossless chunks rather than aborting calibration at the MQTT packet
+size limit. See [diagnostic formats and limitations](../README.md#firmware-diagnostics-and-preserved-failures).
+Do not factory-reset or repeat calibration just to collect logs.
 
 When updating the publisher, copy both `reef_mqtt.py` and `reef_mqtt_payload.py`
 from the same version, then restart the interpreter to discard cached imports.

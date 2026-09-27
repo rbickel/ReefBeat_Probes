@@ -33,7 +33,7 @@ errors indicate that bonding is required. This is not ReefControl installation.
 
 Run [reef_mqtt.py](reef_mqtt.py) on Raspberry Pi OS **Bookworm or newer
 (Python 3.11+)**, using the Pi 3's Bluetooth LE adapter. Copy
-`reef_mqtt.py`, `reef_mqtt_linux.py`, `reef_mqtt_payload.py`,
+`reef_mqtt.py`, `reef_mqtt_linux.py`, `reef_mqtt_payload.py`, `reef_mqtt_diagnostics.py`,
 `reef_calibration.py`, `reef_probe_protocol.py`, `reef_probe.py`, `requirements.txt`, and the local
 `.env` file to the Pi; the extracted APK is not needed at runtime.
 Create a new venv on the Pi with the setup commands above rather than copying
@@ -417,6 +417,8 @@ validated MQTT commands are received**.
 | `reef/sump_ph/calibration/command` | Operator commands | Send QoS 1, **retain=false** |
 | `reef/sump_ph/calibration/state` | Stage, tokens, progress, outcome | Retained |
 | `reef/sump_ph/calibration/event` | Command results, progress and snapshots | Not retained |
+| `reef/sump_ph/calibration/failure` | Full initiating failure, preserved after recovery | Retained |
+| `reef/reef_probe/diagnostics/...` | Full firmware responses and request context | Retained |
 | `reef/reef_probe/availability` | Normal measurement availability | Retained; offline throughout calibration/return |
 
 The state and event topics are separate from your existing aquarium measurement
@@ -431,6 +433,78 @@ Do not create automations that repeatedly send calibration commands, and never
 store commands as retained messages. Retained deliveries are rejected, but MQTT
 3.1.1 normally clears RETAIN when forwarding a live publication to an existing
 subscriber; always set retain=false at the sending client as well.
+
+### Firmware diagnostics and preserved failures
+
+The bridge forwards complete decoded firmware JSON, including unrecognized fields,
+instead of selecting only pH, temperature, `calibration_status`, and `time_left`.
+Existing aquarium sensor payloads and command envelopes stay unchanged.
+
+Subscribe to `reef/reef_probe/diagnostics/#` for these retained documents:
+
+| Suffix below `reef/reef_probe/diagnostics` | When captured |
+| --- | --- |
+| `/telemetry` | Each normal sample, and session-start diagnostics |
+| `/firmware`, `/config` | At session start |
+| `/calibration-log/mid`, `/calibration-log/high` | At session start |
+| `/calibration-enter`, `/calibration-exit` | Acknowledgements or rejected/ambiguous responses to authorized commands |
+| `/calibration-point-start/mid`, `/calibration-point-start/high` | Point-start request and full response |
+| `/calibration-status/mid`, `/calibration-status/high` | Every calibration status read, including terminal/unknown statuses |
+| `/telemetry/mid`, `/telemetry/high` | Buffer readings before starting a point, during status polling, and after terminal status |
+
+Documents include timestamps, method/path, full `response`, and, during a session,
+the request body, point, boot/session/command IDs and request duration. Buffer
+readings are diagnostic only: they never overwrite aquarium pH/temperature topics.
+A complete firmware rejection of buffer telemetry is reported as
+`diagnostic_unavailable`; further optional buffer telemetry is skipped for that
+point. Transport or malformed-response failures still require recovery because
+the BLE stream can no longer be trusted. A last available buffer sample may
+precede completion; inspect its timestamp rather than treating it as an accuracy
+verification.
+
+`progress` now contains the complete last calibration-status response, including
+`stability_progress` with its original firmware type. Progress and point-completed
+events also include the full response under `data`. Missing/non-numeric fields
+are not fabricated. Valid JSON rejection bodies and ambiguous POST responses
+are preserved; malformed JSON/protocol error packets include raw hex when available.
+This covers the existing allowlisted endpoints, not arbitrary/undocumented firmware
+operations or a complete raw BLE packet log.
+
+On failure, `reef/sump_ph/calibration/failure` stores the initiating reason,
+failure kind, original stage/point, elapsed seconds, timeout settings, completed
+points, last exchange, full last status/telemetry, and transport state. A `failed`
+event is also emitted. Recovery and normal monitoring do not erase that retained
+document. Repeated reconnect errors do not replace the initiating failure in
+memory. If MQTT is unavailable, it is retried after reconnection without replaying
+any BLE writes. Once sent, the retained document survives a Pico reboot (subject
+to broker retention/persistence); an unsent in-memory document cannot survive
+power loss. A newer independent failure replaces the previous retained failure.
+
+The normal calibration state includes a compact `last_failure` summary and
+`failure_topic`/`diagnostics_topic` references. Existing Home Assistant sensors
+using `json_attributes_topic` receive these automatically. Firmware snapshots
+are last-value records, not an unlimited historical archive; record the event
+stream externally if the complete chronology is needed.
+
+Large documents are not truncated or allowed to exceed the Pico's 4096-byte MQTT
+packet limit. Documents above 3072 serialized bytes use fixed `/chunks/0`, `/chunks/1`,
+etc. subtopics. Each chunk contains a `capture_id`, `index` and base64 `data`.
+The base topic is published last with `format: "chunked-json"`, matching
+`capture_id`, `parts`, `bytes`, and `parts_topic`. To reconstruct, require all
+indices from zero to `parts - 1` with matching IDs, concatenate base64-decoded
+bytes in order, check the byte count, then decode the UTF-8 JSON. Ignore stale
+extra chunks and never interpret an incomplete/mixed capture as complete.
+Event chunks remain non-retained. Oversized state attributes are replaced by
+explicit references to their full diagnostic topic so control tokens stay usable.
+This does not remove the firmware parser's 64 KiB response ceiling or the Pico's
+finite memory limits.
+
+No reset, automatic calibration retry, acceptance-range guess, or timeout
+increase is introduced. The host still requires `in_progress` then `success`;
+the probe owns stabilization, with a 360-second host deadline. A simulated
+180-second high-point run and each known `fail_*` status are covered offline.
+Without the original failure response, these checks cannot establish the cause
+of a past physical calibration failure.
 
 ### State and command envelope
 
@@ -647,7 +721,7 @@ Example progress event (not retained):
 Command `result: completed` means the action was handled. For `point_ready`, that
 means **the point was started**, not that calibration succeeded. Wait for
 `point_completed`, the expected next state, and finally `two_points_completed`.
-Other event results include `rejected`, `duplicate`, `snapshot`,
+Other event results include `failed`, `rejected`, `duplicate`, `snapshot`,
 `diagnostic_unavailable`, and `monitoring_resumed`.
 
 Commands are serviced about every second while idle/waiting and queued while a
