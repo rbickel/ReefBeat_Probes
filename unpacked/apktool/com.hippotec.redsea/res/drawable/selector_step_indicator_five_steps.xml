@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item android:drawable="@drawable/ic_mat_setup_step_1" app:image_state_default="true" />
+    <item android:drawable="@drawable/ic_mat_setup_step_1" app:image_state1="true" />
+    <item android:drawable="@drawable/ic_mat_setup_step_2" app:image_state2="true" />
+    <item android:drawable="@drawable/ic_mat_setup_step_3" app:image_state3="true" />
+    <item android:drawable="@drawable/ic_mat_setup_step_4" app:image_state4="true" />
+    <item android:drawable="@drawable/ic_mat_setup_step_5" app:image_state5="true" />
+</selector>

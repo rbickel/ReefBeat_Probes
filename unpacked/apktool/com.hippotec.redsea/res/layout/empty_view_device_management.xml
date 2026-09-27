@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout android:id="@id/empty_view_add_device" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_alignParentLeft="true" android:layout_alignParentTop="true" android:layout_alignParentStart="true"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <View android:background="@null" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_marginTop="64.0dip" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toTopOf="parent" />
+    <LinearLayout android:gravity="center" android:id="@id/layout_button" android:background="@drawable/rounded_gray_background" android:paddingLeft="@dimen/padding_20dp" android:paddingRight="@dimen/padding_20dp" android:layout_width="wrap_content" android:layout_height="48.0dip" android:layout_marginBottom="115.0dip" android:backgroundTint="@color/generalMainBlue" android:paddingHorizontal="@dimen/padding_20dp" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent">
+        <ImageView android:id="@id/add_device_button" android:layout_width="18.0dip" android:layout_height="18.0dip" android:layout_marginEnd="5.0dip" app:srcCompat="@drawable/add_icon_white" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="17.0sp" android:textStyle="bold|italic" android:textColor="@color/white" android:id="@id/add_device_text_view" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="6.0dip" android:text="@string/add_a_device" />
+    </LinearLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>

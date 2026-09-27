@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout android:id="@id/view_container" android:background="@color/backgroundMain" android:fitsSystemWindows="true" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <RelativeLayout android:orientation="vertical" android:layout_width="0.0dip" android:layout_height="0.0dip" app:layout_constraintBottom_toTopOf="@id/tabbar" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toTopOf="parent">
+        <RelativeLayout android:id="@id/layout_toolbar" android:background="@drawable/toolbar_background" android:layout_width="fill_parent" android:layout_height="@dimen/toolbar_min_height">
+            <View android:id="@id/menu_anchor" android:layout_width="1.0dip" android:layout_height="fill_parent" android:layout_marginEnd="16.0dip" android:layout_alignParentEnd="true" />
+            <Spinner android:id="@id/aquarium_selector_spinner" android:background="@null" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_centerVertical="true" android:spinnerMode="dropdown" android:layout_marginStart="40.0dip" android:layout_marginEnd="40.0dip" android:layout_alignParentStart="true" android:overlapAnchor="false" />
+            <ImageView android:id="@id/iv_menu_dots" android:paddingLeft="16.0dip" android:paddingRight="16.0dip" android:layout_width="wrap_content" android:layout_height="fill_parent" android:src="@drawable/icu_menu_red_dots" android:layout_alignParentEnd="true" android:paddingHorizontal="16.0dip" app:tint="@color/generalBlack" />
+        </RelativeLayout>
+        <androidx.swiperefreshlayout.widget.SwipeRefreshLayout android:id="@id/swipe_layout" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_below="@id/shortcuts_homepage">
+            <FrameLayout android:name="com.hippotec.redsea.fragments.DashboardFragment" android:id="@id/fragment" android:layout_width="fill_parent" android:layout_height="fill_parent" />
+        </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+        <LinearLayout android:orientation="horizontal" android:id="@id/shortcuts_homepage" android:layout_width="fill_parent" android:layout_height="90.0dip" android:layout_below="@id/layout_toolbar" android:layout_centerHorizontal="true">
+            <androidx.recyclerview.widget.RecyclerView android:orientation="horizontal" android:id="@id/shortcuts_rv" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="fill_parent" />
+            <com.hippotec.redsea.ui.RetryLoaderView android:id="@id/fetching_data_shortcuts_loader" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="fill_parent" />
+            <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="14.0sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/fetching_data_shortcuts_tv" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="fill_parent" android:text="Fetching shortcuts..." />
+            <LinearLayout android:gravity="center" android:orientation="vertical" android:id="@id/fetching_data_shortcuts_failed_layout" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="fill_parent">
+                <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="16.0sp" android:textColor="@color/generalBlack" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Fetching shortcuts Failed..." />
+                <com.hippotec.redsea.ui.fonted.FontedButton android:enabled="true" android:textSize="@dimen/text_size_17sp" android:textStyle="bold|italic" android:textColor="@color/selector_button" android:id="@id/btn_retry" android:background="@drawable/selector_activity_button_background" android:layout_width="150.0dip" android:layout_height="35.0dip" android:layout_marginTop="5.0dip" android:text="Retry" android:textAllCaps="false" />
+            </LinearLayout>
+        </LinearLayout>
+    </RelativeLayout>
+    <com.hippotec.redsea.ui.TabbarView android:id="@id/tabbar" android:layout_width="0.0dip" android:layout_height="@dimen/tabbar_height" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent" app:tbv_tab="home" />
+    <include android:visibility="gone" layout="@layout/tutorial_dashboard" />
+</androidx.constraintlayout.widget.ConstraintLayout>

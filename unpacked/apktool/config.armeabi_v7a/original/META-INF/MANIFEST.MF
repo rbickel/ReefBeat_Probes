@@ -1,0 +1,14 @@
+Manifest-Version: 1.0
+
+Name: AndroidManifest.xml
+SHA1-Digest: vfah2bxag0ecSFDiKrTwZ9yuPoU=
+
+Name: lib/armeabi-v7a/libjdns_sd.so
+SHA1-Digest: 8WZ+5RrwugXiRXI9VkEMwvCgoiE=
+
+Name: lib/armeabi-v7a/libjdns_sd_embedded.so
+SHA1-Digest: pqExZS1jOr2glZ72IgN7KnLhegA=
+
+Name: stamp-cert-sha256
+SHA1-Digest: 5vTkm69vqAbusD/fho7oWwc7j+I=
+

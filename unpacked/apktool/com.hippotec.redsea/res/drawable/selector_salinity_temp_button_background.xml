@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_selected="false" android:drawable="@drawable/shape_probe_button_unselected" />
+    <item android:state_selected="true" android:drawable="@drawable/shape_salinity_temp_button_selected" />
+</selector>

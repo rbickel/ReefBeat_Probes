@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout android:focusable="false" android:clickable="false" android:layout_width="wrap_content" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <ImageView android:id="@id/iv_setup_icon" android:focusable="false" android:clickable="false" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@null" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toTopOf="parent" />
+    <com.hippotec.redsea.ui.fonted.FontedButton android:textSize="@dimen/text_size_17sp" android:textStyle="bold|italic" android:textColor="@color/generalWhite" android:id="@id/tv_no_data_title" android:background="@drawable/rounded_background_blue_100dp" android:focusable="false" android:clickable="false" android:layout_width="wrap_content" android:layout_height="48.0dip" android:layout_marginTop="-46.0dip" android:textAllCaps="false" android:paddingStart="20.0dip" android:paddingEnd="20.0dip" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toBottomOf="@id/iv_setup_icon" />
+</androidx.constraintlayout.widget.ConstraintLayout>

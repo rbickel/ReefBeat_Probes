@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:orientation="vertical" android:background="@color/backgroundMain" android:focusable="true" android:focusableInTouchMode="true" android:fitsSystemWindows="true" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <androidx.appcompat.widget.Toolbar android:id="@id/toolbar" android:background="@drawable/toolbar_background" android:layout_width="fill_parent" android:layout_height="wrap_content" android:minHeight="@dimen/toolbar_min_height" app:contentInsetStartWithNavigation="0.0dip" app:theme="@style/AppTheme.AppBarOverlay" />
+    <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_18sp_orig" android:textStyle="bold|italic" android:textColor="@color/selector_save_button_text_color" android:gravity="center" android:id="@id/save_view" android:padding="20.0dip" android:layout_width="wrap_content" android:layout_height="@dimen/toolbar_min_height" android:text="@string/apply" android:layout_alignParentTop="true" android:layout_alignParentRight="true" android:layout_alignParentEnd="true" />
+    <ScrollView android:layout_width="fill_parent" android:layout_height="fill_parent" android:fillViewport="true" android:layout_below="@id/toolbar">
+        <androidx.constraintlayout.widget.ConstraintLayout android:id="@id/presentations_container" android:background="@color/backgroundSecond" android:layout_width="fill_parent" android:layout_height="wrap_content">
+            <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/all_devices_rc" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="16.0dip" app:chr_border="both" app:chr_label="@string/all_devices" app:layout_constraintTop_toTopOf="parent" />
+            <View android:background="@color/separatorDarkGrey" android:layout_width="fill_parent" android:layout_height="0.5dip" app:layout_constraintBottom_toTopOf="@id/specific_devices_container" />
+            <LinearLayout android:orientation="vertical" android:id="@id/specific_devices_container" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="16.0dip" app:layout_constraintTop_toBottomOf="@id/all_devices_rc">
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/led_rc" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_led" />
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/dose_rc" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_dosing" />
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/mat_rc" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_mat" />
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/wave_rc" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_waves" />
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/ato_rc" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_ato" />
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/run_rc" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_run" />
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/power_rc" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_power" />
+                <com.hippotec.redsea.ui.CheckableRowControl android:id="@id/control_rc" android:layout_width="fill_parent" android:layout_height="wrap_content" app:chr_border="bottom" app:chr_label="@string/reef_control" />
+            </LinearLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
+    </ScrollView>
+</RelativeLayout>

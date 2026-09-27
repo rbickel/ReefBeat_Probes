@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <LinearLayout android:orientation="vertical" android:id="@id/regular_content" android:paddingTop="20.0dip" android:paddingBottom="20.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_centerInParent="true" android:paddingStart="15.0dip" android:paddingEnd="20.0dip" android:layout_marginEnd="10.0dip" android:paddingVertical="20.0dip">
+        <ScrollView android:id="@id/animation_notice_scroll_view" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="20.0dip">
+            <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_medium" android:textColor="@color/white" android:gravity="center" android:layout_gravity="center_horizontal" android:id="@id/animation_notice_text_view" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        </ScrollView>
+        <com.airbnb.lottie.LottieAnimationView android:layout_gravity="center_horizontal" android:id="@id/animation_view" android:layout_width="@dimen/progress_dialog_size" android:layout_height="@dimen/progress_dialog_size" app:lottie_autoPlay="true" app:lottie_fileName="loader05.json" app:lottie_loop="true" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_medium" android:textColor="@color/white" android:gravity="center" android:layout_gravity="center_horizontal" android:id="@id/firmware_update_textview" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="@dimen/padding_20dp" android:text="@string/updating_firmware_few_minutes" />
+    </LinearLayout>
+    <RelativeLayout android:id="@id/led_preview_content" android:focusable="true" android:visibility="gone" android:clickable="true" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_centerInParent="true">
+        <ImageView android:layout_gravity="center_horizontal" android:id="@id/led_play_button" android:padding="@dimen/padding_10dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_centerInParent="true" android:elevation="4.0dip" app:srcCompat="@null" />
+        <ProgressBar android:id="@id/led_play_progress_bar" android:paddingLeft="11.0dip" android:paddingTop="9.0dip" android:paddingRight="11.0dip" android:paddingBottom="16.0dip" android:visibility="visible" android:layout_width="95.0dip" android:layout_height="95.0dip" android:layout_centerInParent="true" android:alpha="1.0" android:elevation="5.0dip" android:indeterminateTint="@color/backgroundSecond" android:indeterminateTintMode="src_in" style="?android:progressBarStyle" />
+    </RelativeLayout>
+    <RelativeLayout android:id="@id/preview_content" android:focusable="true" android:visibility="gone" android:clickable="true" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_centerInParent="true">
+        <androidx.appcompat.widget.AppCompatImageButton android:id="@id/btn_stop_preview" android:background="@drawable/ic_pause" android:visibility="visible" android:layout_width="68.69998dip" android:layout_height="72.0dip" android:layout_centerInParent="true" />
+        <com.airbnb.lottie.LottieAnimationView android:id="@id/progress_view" android:visibility="visible" android:layout_width="68.69998dip" android:layout_height="68.69998dip" android:layout_alignParentTop="true" app:lottie_autoPlay="true" app:lottie_fileName="preview_progress.json" app:lottie_loop="true" />
+    </RelativeLayout>
+</RelativeLayout>

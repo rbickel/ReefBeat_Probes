@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout android:layout_width="fill_parent" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <com.hippotec.redsea.ui.ClickableRowControl android:id="@id/device_cr" android:layout_width="fill_parent" android:layout_height="78.0dip" app:cr_border="top" app:cr_label_size="@dimen/text_size_17sp" app:cr_label_style="@integer/bold_italic" app:layout_constraintTop_toBottomOf="@id/grouped_devices_view" />
+    <View android:id="@id/separator" android:background="@color/separatorDefault" android:layout_width="fill_parent" android:layout_height="0.5dip" android:layout_marginLeft="16.0dip" android:layout_marginRight="16.0dip" android:layout_marginHorizontal="16.0dip" app:layout_constraintTop_toTopOf="parent" />
+    <com.hippotec.redsea.ui.ShortcutsGroupedDeviceView android:id="@id/grouped_devices_view" android:layout_width="fill_parent" android:layout_height="wrap_content" app:layout_constraintTop_toTopOf="parent" />
+    <LinearLayout android:orientation="vertical" android:id="@id/delay_layout" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginBottom="24.0dip" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintTop_toBottomOf="@id/device_cr">
+        <LinearLayout android:orientation="horizontal" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_marginLeft="@dimen/padding_16dp" android:layout_marginRight="@dimen/padding_16dp" android:layout_marginHorizontal="@dimen/padding_16dp">
+            <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:layout_width="0.0dip" android:layout_height="wrap_content" android:text="@string/run_shortcut_off_delay_action" android:layout_weight="1.0" />
+            <com.google.android.material.materialswitch.MaterialSwitch android:id="@id/delay_switch" android:layout_width="wrap_content" android:layout_height="wrap_content" style="@style/AppTheme.Switch.SupportDark" />
+        </LinearLayout>
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_15sp" android:textColor="@color/generalLightGrey" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="16.0dip" android:layout_marginTop="24.0dip" android:layout_marginRight="16.0dip" android:text="@string/run_shortcut_off_delay_action_description" android:layout_marginHorizontal="16.0dip" />
+    </LinearLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>

@@ -1,0 +1,11 @@
+.class public interface abstract Ln6/a;
+.super Ljava/lang/Object;
+.source "SourceFile"
+
+
+# virtual methods
+.method public abstract a(JJ)V
+.end method
+
+.method public abstract b()V
+.end method

@@ -1,0 +1,60 @@
+.class public final synthetic Lx5/w;
+.super Ljava/lang/Object;
+.source "SourceFile"
+
+# interfaces
+.implements LD5/e;
+
+
+# instance fields
+.field public final synthetic a:Lx5/B;
+
+.field public final synthetic b:Ls5/t;
+
+.field public final synthetic c:Lcom/hippotec/redsea/model/dto/MatDevice;
+
+.field public final synthetic d:LD5/f;
+
+
+# direct methods
+.method public synthetic constructor <init>(Lx5/B;Ls5/t;Lcom/hippotec/redsea/model/dto/MatDevice;LD5/f;)V
+    .locals 0
+
+    .line 1
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+
+    iput-object p1, p0, Lx5/w;->a:Lx5/B;
+
+    iput-object p2, p0, Lx5/w;->b:Ls5/t;
+
+    iput-object p3, p0, Lx5/w;->c:Lcom/hippotec/redsea/model/dto/MatDevice;
+
+    iput-object p4, p0, Lx5/w;->d:LD5/f;
+
+    return-void
+.end method
+
+
+# virtual methods
+.method public final a(ZLjava/lang/Object;)V
+    .locals 6
+
+    .line 1
+    iget-object v0, p0, Lx5/w;->a:Lx5/B;
+
+    iget-object v1, p0, Lx5/w;->b:Ls5/t;
+
+    iget-object v2, p0, Lx5/w;->c:Lcom/hippotec/redsea/model/dto/MatDevice;
+
+    iget-object v3, p0, Lx5/w;->d:LD5/f;
+
+    move-object v5, p2
+
+    check-cast v5, Lorg/json/JSONObject;
+
+    move v4, p1
+
+    invoke-static/range {v0 .. v5}, Lx5/B;->h(Lx5/B;Ls5/t;Lcom/hippotec/redsea/model/dto/MatDevice;LD5/f;ZLorg/json/JSONObject;)V
+
+    return-void
+.end method

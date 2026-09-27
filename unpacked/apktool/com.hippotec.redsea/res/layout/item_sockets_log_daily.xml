@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout android:orientation="vertical" android:background="@color/backgroundThird" android:layout_width="wrap_content" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <LinearLayout android:orientation="horizontal" android:id="@id/logs" android:layout_width="wrap_content" android:layout_height="60.0dip" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toTopOf="parent">
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_1" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_2" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_3" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_4" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_5" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_6" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_7" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+        <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textColor="@color/generalBlack" android:gravity="center" android:id="@id/tv_consumption_8" android:paddingBottom="4.0dip" android:layout_width="100.0dip" android:layout_height="fill_parent" />
+    </LinearLayout>
+    <View android:id="@id/divider" android:background="@color/separatorDarkGrey" android:layout_width="fill_parent" android:layout_height="0.5dip" app:layout_constraintTop_toBottomOf="@id/logs" />
+    <LinearLayout android:orientation="vertical" android:id="@id/expandable_content" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="wrap_content" app:layout_constraintTop_toBottomOf="@id/divider">
+        <androidx.recyclerview.widget.RecyclerView android:id="@id/hourly_data_recycler" android:layout_width="fill_parent" android:layout_height="wrap_content" android:nestedScrollingEnabled="false" />
+    </LinearLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>

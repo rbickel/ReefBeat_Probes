@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:layout_width="fill_parent" android:layout_height="80.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <ImageView android:id="@id/item_icon" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@null" android:layout_centerVertical="true" android:paddingStart="16.0dip" />
+    <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_medium" android:textStyle="bold|italic" android:textColor="@color/generalBlack" android:id="@id/item_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Test" android:layout_toRightOf="@id/item_icon" android:layout_centerVertical="true" android:layout_marginStart="16.0dip" />
+    <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/ic_arrow_right_black" android:layout_centerVertical="true" android:layout_marginEnd="16.0dip" android:layout_alignParentEnd="true" />
+    <RelativeLayout android:background="@color/separatorDefault" android:layout_width="fill_parent" android:layout_height="0.5dip" android:layout_alignParentBottom="true" />
+</RelativeLayout>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="bootstrap_progress_bar_control_height">44.0dip</dimen>
+    <dimen name="bootstrap_progress_bar_default_font_size">28.0dip</dimen>
+    <dimen name="bootstrap_progress_bar_height">40.0dip</dimen>
+    <dimen name="bootstrap_progress_bar_unit_default_font_size">23.0dip</dimen>
+    <dimen name="manual_dose_container_size">85.0dip</dimen>
+    <item type="dimen" name="step_confirmation_guideline_percentage">0.635</item>
+    <item type="dimen" name="step_priming_guideline_percentage">0.36</item>
+    <dimen name="text_size_18sp">22.0sp</dimen>
+</resources>

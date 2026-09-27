@@ -1,0 +1,621 @@
+"""Offline calibration policy tests: no hardware, MQTT broker, or calibration I/O."""
+
+import asyncio
+import errno
+import json
+from pathlib import Path
+import re
+import tempfile
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
+
+import reef_mqtt
+from reef_calibration import Calibration, PendingMarker, CACHE_LIMIT
+from reef_probe_protocol import POST, ProbeError, ProbeRejected
+
+TELEMETRY = {"value": 8.2, "mv": -10, "temperature_value": 25.1,
+             "temperature_mv": 1590, "status": "connected"}
+
+
+class MemoryMarker:
+    def __init__(self, pending=False):
+        self.pending = pending
+        self.sets = 0
+        self.clears = 0
+
+    def exists(self):
+        return self.pending
+
+    def set(self):
+        self.pending = True
+        self.sets += 1
+
+    def clear(self):
+        self.pending = False
+        self.clears += 1
+
+
+class Runtime:
+    errors = (OSError, ValueError, ProbeError, TimeoutError)
+
+    def __init__(self):
+        self.now = 0
+        self.calls = []
+        self.published = []
+        self.indications = []
+        self.statuses = []
+        self.history_unavailable = False
+        self.fail = None
+        self.telemetry = dict(TELEMETRY)
+
+    def ticks(self):
+        return self.now
+
+    def elapsed(self, start):
+        return self.now - start
+
+    def epoch(self):
+        return 1800000000 + int(self.now)
+
+    def timestamp(self):
+        return "2027-01-15T08:00:00Z"
+
+    async def publish(self, topic, payload, retain=True):
+        self.published.append((topic, payload, retain))
+
+    async def indicate(self, event):
+        self.indications.append(event)
+
+    async def request(self, path, payload=None, method=1):
+        self.calls.append((path, payload, method))
+        if self.fail == path:
+            raise TimeoutError()
+        if path == "/telemetry":
+            return dict(self.telemetry)
+        if path == "/calibration-status":
+            return self.statuses.pop(0)
+        if path == "/calibration-log" and self.history_unavailable:
+            raise ProbeRejected({"success": False, "message": "No manual calibration found"})
+        return {"success": True}
+
+
+class CalibrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.cfg = reef_mqtt.Settings(calibration_enabled=True)
+        self.marker = MemoryMarker()
+        self.runtime = Runtime()
+        self.counter = 0
+        self.command_number = 0
+        self.controller = Calibration(self.cfg, self.marker, self.new_token)
+
+    def new_token(self):
+        self.counter += 1
+        return "%032x" % self.counter
+
+    def command(self, action, **fields):
+        self.command_number += 1
+        data = {
+            "action": action, "boot_id": self.controller.boot_id,
+            "nonce": self.controller.nonce, "command_id": "cmd-%s" % self.command_number,
+            "expires_at": self.runtime.epoch() + 60,
+        }
+        if action != "start":
+            data.update(session_id=self.controller.session_id, confirm=True)
+        data.update(fields)
+        return data
+
+    async def send(self, action, **fields):
+        data = self.command(action, **fields)
+        await self.controller.handle(self.runtime, json.dumps(data).encode())
+        return data
+
+    async def start_point(self, point):
+        await self.send("point_ready", point=point, solution_ph=7 if point == "mid" else 10,
+                        solution_rated_temp=25)
+
+    async def complete_point(self):
+        self.runtime.statuses.extend([
+            {"calibration_status": "in_progress", "time_left": 3},
+            {"calibration_status": "success", "time_left": 0},
+        ])
+        await self.controller.tick(self.runtime)
+        self.runtime.now += 3
+        await self.controller.tick(self.runtime)
+
+    def events(self, result=None):
+        events = [json.loads(payload) for topic, payload, retain in self.runtime.published
+                  if topic == self.cfg.calibration_event_topic]
+        return events if result is None else [e for e in events if e["result"] == result]
+
+    def writes(self):
+        return [call for call in self.runtime.calls if call[2] == POST]
+
+    async def test_start_inhibits_publication_and_persists_before_any_mutation(self):
+        await self.send("start")
+        self.assertEqual(self.controller.state, "awaiting_mid")
+        self.assertTrue(self.marker.pending)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.runtime.calls[0][0], "/telemetry")
+        self.assertEqual(self.runtime.published[0],
+                         (self.cfg.availability_topic, "offline", True))
+        self.assertEqual(len(self.events("snapshot")), 3)
+
+    async def test_full_two_point_sequence_requires_return_and_settle(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.assertEqual(self.controller.state, "calibrating_mid")
+        await self.complete_point()
+        self.assertEqual(self.controller.state, "awaiting_high")
+        await self.start_point("high")
+        await self.complete_point()
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertTrue(self.controller.inhibits_measurements)
+        self.assertEqual(self.controller.completed_points, ["mid", "high"])
+        self.assertEqual([c[0] for c in self.writes()], [
+            "/calibration-enter", "/calibration-point-start",
+            "/calibration-point-start", "/calibration-exit",
+        ])
+        self.assertEqual(self.writes()[0][1]["time"], 1800000000)
+        self.assertEqual(self.writes()[1][1], {
+            "point": "mid", "solution_ph": 7, "solution_rated_temp": 25,
+        })
+        await self.send("returned")
+        self.assertEqual(self.controller.state, "settling")
+        self.runtime.now += self.cfg.calibration_settle_seconds - 1
+        await self.controller.tick(self.runtime)
+        self.assertTrue(self.marker.pending)
+        self.runtime.now += 1
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "idle")
+        self.assertFalse(self.marker.pending)
+        self.assertFalse(any(t in (self.cfg.ph_topic, self.cfg.temperature_topic)
+                             for t, _, _ in self.runtime.published))
+
+    async def test_history_absence_reported_not_fabricated_or_fatal(self):
+        self.runtime.history_unavailable = True
+        await self.send("start")
+        self.assertEqual(self.controller.state, "awaiting_mid")
+        self.assertEqual(len(self.events("diagnostic_unavailable")), 2)
+        self.assertEqual(self.writes(), [])
+
+    async def test_retained_malformed_expired_and_wrong_boot_commands_never_write(self):
+        command = self.command("start")
+        await self.controller.handle(self.runtime, json.dumps(command).encode(), retained=True)
+        for payload in (
+            b"[]", b"no-json", b"x" * 1025, b"\xff", b"{}",
+            json.dumps({**command, "boot_id": "old-boot"}).encode(),
+            json.dumps({**command, "nonce": "stale"}).encode(),
+            json.dumps({**command, "expires_at": self.runtime.epoch()}).encode(),
+            json.dumps({**command, "expires_at": self.runtime.epoch() + 121}).encode(),
+            json.dumps({**command, "expires_at": True}).encode(),
+            json.dumps({**command, "action": "factory_reset"}).encode(),
+        ):
+            await self.controller.handle(self.runtime, payload)
+        self.assertEqual(self.controller.state, "idle")
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.marker.sets, 0)
+        self.assertEqual(len(self.events("rejected")), 12)
+
+    async def test_duplicate_command_is_not_executed_twice(self):
+        data = await self.send("start")
+        calls = list(self.runtime.calls)
+        await self.controller.handle(self.runtime, json.dumps(data))
+        self.assertEqual(self.runtime.calls, calls)
+        self.assertEqual(len(self.events("duplicate")), 1)
+        await self.controller.handle(self.runtime, json.dumps({**data, "expires_at": data["expires_at"] + 1}))
+        self.assertEqual(len(self.events("rejected")), 1)
+        await self.start_point("mid")
+        command = self.controller.cache[-1][0]
+        writes = len(self.writes())
+        await self.controller.handle(self.runtime, json.dumps(command))
+        self.assertEqual(len(self.writes()), writes)
+
+    async def test_old_nonce_and_wrong_session_cannot_start_next_step(self):
+        data = await self.send("start")
+        await self.send("point_ready", point="mid", solution_ph=7, solution_rated_temp=25,
+                        nonce=data["nonce"])
+        await self.send("point_ready", point="mid", solution_ph=7, solution_rated_temp=25,
+                        session_id="old-session")
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(len(self.events("rejected")), 2)
+
+    async def test_buffer_validation_and_out_of_order_commands(self):
+        await self.send("start")
+        for fields in (
+            {"point": "high"}, {"point": 1}, {"solution_ph": float("nan")},
+            {"solution_ph": True}, {"solution_rated_temp": 25.0}, {"solution_rated_temp": True},
+            {"solution_rated_temp": 35}, {"confirm": False}, {"unknown": 1},
+        ):
+            args = {"point": "mid", "solution_ph": 7, "solution_rated_temp": 25, **fields}
+            await self.send("point_ready", **args)
+        self.assertEqual(self.writes(), [])
+        await self.send("returned")
+        self.assertEqual(self.controller.state, "awaiting_mid")
+        self.assertEqual(len(self.events("rejected")), 10)
+
+    async def test_progress_poll_period_and_stale_success(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.statuses = [
+            {"calibration_status": "success"}, {"calibration_status": "in_progress"},
+            {"calibration_status": "success"},
+        ]
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "calibrating_mid")
+        await self.controller.tick(self.runtime)
+        self.assertEqual(len(self.runtime.statuses), 2)
+        self.runtime.now += 3
+        await self.controller.tick(self.runtime)
+        self.runtime.now += 3
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_high")
+
+    async def test_point_failure_or_deadline_requires_operator_recovery(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.statuses = [{"calibration_status": "fail_stability"}]
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertTrue(self.marker.pending)
+        self.assertNotIn("/calibration-exit", [c[0] for c in self.writes()])
+        self.runtime.telemetry["status"] = "calibration"
+        await self.send("recover")
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertEqual(self.writes()[-1][0], "/calibration-exit")
+
+    async def test_point_timeout_does_not_issue_a_second_write(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.now += self.cfg.calibration_timeout
+        before = self.writes()
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.writes(), before)
+
+    async def test_cancel_before_first_point_needs_return_but_no_ble_write(self):
+        await self.send("start")
+        await self.send("cancel")
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertTrue(self.marker.pending)
+
+    async def test_cancel_in_progress_exits_once_and_not_rollback(self):
+        await self.send("start")
+        await self.start_point("mid")
+        cancel = await self.send("cancel")
+        await self.controller.handle(self.runtime, json.dumps(cancel))
+        self.assertEqual(len([c for c in self.writes() if c[0] == "/calibration-exit"]), 1)
+        self.assertIn("partial", self.controller.outcome)
+        self.assertTrue(self.marker.pending)
+
+    async def test_uncertain_write_is_not_repeated_on_reconnect_or_duplicate(self):
+        await self.send("start")
+        self.runtime.fail = "/calibration-point-start"
+        data = self.command("point_ready", point="mid", solution_ph=7, solution_rated_temp=25)
+        with self.assertRaises(TimeoutError):
+            await self.controller.handle(self.runtime, json.dumps(data))
+        self.assertEqual(self.controller.state, "recovery_required")
+        before = self.writes()
+        await self.controller.connected(self.runtime)
+        await self.controller.handle(self.runtime, json.dumps(data))
+        self.assertEqual(self.writes(), before)
+        self.assertEqual(self.events("duplicate")[-1]["original_result"], "failed_or_uncertain")
+
+    async def test_reboot_with_pending_marker_cannot_auto_resume_or_publish(self):
+        old_boot = self.controller.boot_id
+        await self.send("start")
+        self.controller = Calibration(self.cfg, self.marker, self.new_token)
+        self.assertNotEqual(self.controller.boot_id, old_boot)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.writes(), [])
+        await self.send("start")
+        self.assertEqual(self.controller.state, "recovery_required")
+        await self.send("recover")
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertEqual(self.writes(), [])
+
+    async def test_wait_timeout_keeps_measurements_blocked(self):
+        await self.send("start")
+        self.runtime.now += self.cfg.calibration_wait_timeout
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertTrue(self.marker.pending)
+
+    async def test_unknown_probe_calibration_state_fails_instead_of_guessing(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.statuses = [{"calibration_status": "surprise"}]
+        with self.assertRaisesRegex(ProbeError, "Unknown calibration state"):
+            await self.controller.tick(self.runtime)
+        self.controller.transport_failed(ProbeError("unknown state"))
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertTrue(self.marker.pending)
+
+    async def test_rejected_or_ambiguous_exit_never_resumes_monitoring(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.fail = "/calibration-exit"
+        with self.assertRaises(TimeoutError):
+            await self.send("cancel")
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertTrue(self.marker.pending)
+        self.runtime.fail = None
+        self.runtime.telemetry["status"] = "out_of_range"
+        with self.assertRaises(ProbeError):
+            await self.send("recover")
+        self.assertTrue(self.controller.inhibits_measurements)
+
+    async def test_no_explicit_post_success_is_not_accepted(self):
+        await self.send("start")
+        original = self.runtime.request
+
+        async def request(path, payload=None, method=1):
+            if method == POST:
+                return {"message": "ambiguous"}
+            return await original(path, payload, method)
+
+        self.runtime.request = request
+        with self.assertRaisesRegex(ProbeError, "explicit success"):
+            await self.start_point("mid")
+        self.assertEqual(self.controller.state, "recovery_required")
+
+    async def test_recovery_requires_new_boot_and_operator_return(self):
+        await self.send("start")
+        old = self.command("cancel")
+        self.controller = Calibration(self.cfg, self.marker, self.new_token)
+        await self.controller.handle(self.runtime, json.dumps(old))
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.events("rejected")[-1]["message"],
+                         "Wrong boot_id; fetch current calibration state.")
+        await self.send("recover")
+        await self.controller.tick(self.runtime)
+        self.assertTrue(self.marker.pending)
+        self.assertEqual(self.controller.state, "awaiting_return")
+
+    async def test_disk_error_prevents_calibration_writes(self):
+        self.marker.set = Mock(side_effect=OSError("read-only filesystem"))
+        with self.assertRaises(OSError):
+            await self.send("start")
+        self.assertEqual(self.runtime.calls, [])
+        self.assertTrue(self.controller.inhibits_measurements)
+
+    async def test_marker_clear_failure_keeps_settling_guard(self):
+        await self.send("start")
+        await self.send("cancel")
+        await self.send("returned")
+        self.marker.clear = Mock(side_effect=OSError("disk error"))
+        self.runtime.now += self.cfg.calibration_settle_seconds
+        with self.assertRaises(OSError):
+            await self.controller.tick(self.runtime)
+        self.assertTrue(self.controller.inhibits_measurements)
+
+    async def test_external_calibration_is_recorded_before_measurement_publication(self):
+        await self.controller.observe(self.runtime, {**TELEMETRY, "status": "calibration"})
+        self.assertTrue(self.marker.pending)
+        self.assertEqual(self.controller.state, "recovery_required")
+
+    async def test_cancel_task_preserves_marker_for_restart_without_exit_write(self):
+        await self.send("start")
+        await self.start_point("mid")
+        # The host stopping must not imply that a remote calibration write rolled back.
+        replacement = Calibration(self.cfg, self.marker, self.new_token)
+        self.assertEqual(replacement.state, "recovery_required")
+        self.assertTrue(replacement.inhibits_measurements)
+        self.assertFalse(any(call[0] == "/calibration-exit" for call in self.writes()))
+
+    async def test_events_not_retained_but_status_is_retained(self):
+        await self.send("start")
+        self.assertTrue(all(not retain for topic, _, retain in self.runtime.published
+                            if topic == self.cfg.calibration_event_topic))
+        self.assertTrue(all(retain for topic, _, retain in self.runtime.published
+                            if topic == self.cfg.calibration_state_topic))
+
+    async def test_cache_is_bounded_and_old_nonce_prevents_evicted_replays(self):
+        old = await self.send("start")
+        # Exercise the eviction path using duplicates of completed sessions.
+        self.controller.cache = [[{"command_id": "filler-%s" % i}, "completed"]
+                                 for i in range(CACHE_LIMIT)]
+        await self.send("cancel")
+        self.assertEqual(len(self.controller.cache), CACHE_LIMIT)
+        await self.controller.handle(self.runtime, json.dumps(old))
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertEqual(self.events("rejected")[-1]["result"], "rejected")
+
+
+class MarkerTests(unittest.TestCase):
+    def test_marker_survives_restart_and_partial_contents_inhibit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pending"
+            marker = PendingMarker(str(path))
+            self.assertFalse(marker.exists())
+            with patch("reef_calibration.os.sync"):
+                marker.set()
+                self.assertTrue(PendingMarker(str(path)).exists())
+                path.write_text("")
+                controller = Calibration(reef_mqtt.Settings(calibration_marker_path=str(path)))
+                self.assertEqual(controller.state, "recovery_required")
+                marker.clear()
+            self.assertFalse(marker.exists())
+
+    def test_permission_errors_are_not_treated_as_missing_marker(self):
+        with patch("reef_calibration.os.stat", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaises(OSError):
+                PendingMarker("pending").exists()
+
+    def test_readme_json_examples_parse_and_command_examples_have_envelope(self):
+        content = Path(__file__).with_name("README.md").read_text()
+        examples = [json.loads(text) for text in re.findall(r"```json\n(.*?)\n```", content, re.S)]
+        commands = [item for item in examples if isinstance(item, dict) and "action" in item]
+        self.assertEqual([c["action"] for c in commands],
+                         ["start", "point_ready", "point_ready", "returned", "cancel", "recover"])
+        for command in commands:
+            self.assertTrue({"boot_id", "nonce", "command_id", "expires_at"} <= command.keys())
+            self.assertIsInstance(command["expires_at"], int)
+            if command["action"] != "start":
+                self.assertIs(command["confirm"], True)
+                self.assertIn("session_id", command)
+
+class IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_host_cancellation_keeps_pending_marker_and_marks_offline(self):
+        cfg = reef_mqtt.Settings(calibration_enabled=True)
+        marker = MemoryMarker(True)
+        controller = Calibration(cfg, marker)
+        runtime = Runtime()
+        runtime.prepare = AsyncMock()
+        runtime.connect_probe = AsyncMock()
+        runtime.close = AsyncMock()
+        runtime.mqtt_connected = lambda: True
+        runtime.report = Mock()
+        with (
+            patch("reef_calibration.PendingMarker", return_value=marker),
+            patch("reef_calibration.Calibration", return_value=controller),
+            patch("reef_mqtt.calibration_loop", new_callable=AsyncMock,
+                  side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await reef_mqtt.run_bridge(cfg, runtime, asyncio.Event())
+        self.assertTrue(marker.pending)
+        runtime.close.assert_awaited_once()
+        self.assertEqual(runtime.calls, [])
+        self.assertEqual(runtime.published[-1], (cfg.availability_topic, "offline", True))
+
+    async def test_disabled_calibration_with_pending_marker_refuses_all_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pending"
+            path.write_text("unresolved")
+            settings = reef_mqtt.Settings(calibration_marker_path=str(path))
+            runtime = Mock()
+            with self.assertRaisesRegex(ValueError, "Unresolved calibration"):
+                await reef_mqtt.run_bridge(settings, runtime, asyncio.Event())
+            runtime.prepare.assert_not_called()
+
+    async def test_command_received_during_read_prevents_buffer_publishing(self):
+        cfg = reef_mqtt.Settings(calibration_enabled=True)
+        marker = MemoryMarker()
+        controller = Calibration(cfg, marker)
+        runtime = Runtime()
+        runtime.prepare = AsyncMock()
+        runtime.read = AsyncMock(return_value=TELEMETRY)
+        runtime.report = Mock()
+        stop = asyncio.Event()
+        command = json.dumps({
+            "action": "start", "command_id": "late-start", "boot_id": controller.boot_id,
+            "nonce": controller.nonce, "expires_at": runtime.epoch() + 60,
+        }).encode()
+        runtime.commands = AsyncMock(side_effect=[[], [(command, False)]])
+
+        async def sleep(*args, **kwargs):
+            stop.set()
+
+        runtime.sleep = sleep
+        await reef_mqtt.calibration_loop(cfg, runtime, stop, controller)
+        self.assertEqual(controller.state, "awaiting_mid")
+        self.assertFalse(any(t in (cfg.ph_topic, cfg.temperature_topic)
+                             for t, _, _ in runtime.published))
+
+    async def test_complete_session_in_the_actual_shared_service_loop(self):
+        cfg = reef_mqtt.Settings(calibration_enabled=True, calibration_settle_seconds=2)
+        marker = MemoryMarker()
+        controller = Calibration(cfg, marker)
+        runtime = Runtime()
+        runtime.prepare = AsyncMock()
+        runtime.read = AsyncMock(return_value=TELEMETRY)
+        runtime.report = Mock()
+        stop = asyncio.Event()
+        sent_states = set()
+        actions = []
+        runtime.statuses = [
+            {"calibration_status": "in_progress"}, {"calibration_status": "success"},
+            {"calibration_status": "in_progress"}, {"calibration_status": "success"},
+        ]
+
+        async def commands():
+            state = controller.state
+            if state in sent_states:
+                return []
+            data = {
+                "boot_id": controller.boot_id, "nonce": controller.nonce,
+                "command_id": "step-" + state, "expires_at": runtime.epoch() + 60,
+            }
+            if state == "idle" and not actions:
+                data["action"] = "start"
+            elif state in ("awaiting_mid", "awaiting_high"):
+                point = state[len("awaiting_"):]
+                data.update(action="point_ready", point=point,
+                            solution_ph=7 if point == "mid" else 10,
+                            solution_rated_temp=25)
+            elif state == "awaiting_return":
+                data["action"] = "returned"
+            else:
+                return []
+            if data["action"] != "start":
+                data.update(session_id=controller.session_id, confirm=True)
+            sent_states.add(state)
+            actions.append(data["action"])
+            return [(json.dumps(data).encode(), False)]
+
+        async def publish(topic, payload, retain=True):
+            if topic in (cfg.ph_topic, cfg.temperature_topic):
+                self.assertEqual(controller.state, "idle")
+                self.assertFalse(marker.pending)
+                self.assertEqual(actions, ["start", "point_ready", "point_ready", "returned"])
+            runtime.published.append((topic, payload, retain))
+            if topic == cfg.temperature_topic:
+                stop.set()
+
+        async def sleep(seconds, _stop, monitor_probe=False):
+            runtime.now += max(seconds, 0.1)
+            if runtime.now > 30:
+                raise AssertionError("Shared loop stalled")
+
+        runtime.commands, runtime.publish, runtime.sleep = commands, publish, sleep
+        await reef_mqtt.calibration_loop(cfg, runtime, stop, controller)
+        self.assertEqual(len([t for t, _, _ in runtime.published
+                              if t in (cfg.ph_topic, cfg.temperature_topic)]), 2)
+        self.assertEqual(marker.clears, 1)
+
+    async def test_reboot_pending_session_announces_recovery_without_sampling(self):
+        cfg = reef_mqtt.Settings(calibration_enabled=True)
+        controller = Calibration(cfg, MemoryMarker(True))
+        runtime = Runtime()
+        runtime.prepare = AsyncMock()
+        runtime.read = AsyncMock()
+        runtime.commands = AsyncMock(return_value=[])
+        stop = asyncio.Event()
+
+        async def sleep(*args, **kwargs):
+            stop.set()
+
+        runtime.sleep = sleep
+        await reef_mqtt.calibration_loop(cfg, runtime, stop, controller)
+        runtime.read.assert_not_awaited()
+        self.assertEqual(runtime.calls, [])
+        states = [json.loads(payload) for topic, payload, _ in runtime.published
+                  if topic == cfg.calibration_state_topic]
+        self.assertTrue(all(s["state"] == "recovery_required" for s in states))
+
+    async def test_status_heartbeat_restores_tokens_without_changing_wait_stage(self):
+        cfg = reef_mqtt.Settings(calibration_enabled=True)
+        controller = Calibration(cfg, MemoryMarker(True))
+        runtime = Runtime()
+        runtime.prepare = AsyncMock()
+        runtime.read = AsyncMock()
+        runtime.commands = AsyncMock(return_value=[])
+        stop = asyncio.Event()
+
+        async def sleep(*args, **kwargs):
+            runtime.now += 15
+            if runtime.now >= 45:
+                stop.set()
+
+        runtime.sleep = sleep
+        await reef_mqtt.calibration_loop(cfg, runtime, stop, controller)
+        states = [json.loads(payload) for topic, payload, _ in runtime.published
+                  if topic == cfg.calibration_state_topic]
+        self.assertEqual(len(states), 2)
+        self.assertEqual(states[0]["nonce"], states[1]["nonce"])
+        self.assertEqual(states[1]["epoch"] - states[0]["epoch"], 30)
+        runtime.read.assert_not_awaited()
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:background="@color/backgroundMain" android:fitsSystemWindows="true" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <androidx.appcompat.widget.Toolbar android:id="@id/toolbar" android:background="@drawable/toolbar_background" android:layout_width="fill_parent" android:layout_height="wrap_content" android:minHeight="@dimen/toolbar_min_height" app:contentInsetRight="@dimen/padding_50dp" app:popupTheme="@style/popupMenuStyle" app:theme="@style/AppTheme.AppBarOverlay" app:titleTextAppearance="@style/AppTheme.AppBarOverlay.TextAppearance" />
+    <androidx.recyclerview.widget.RecyclerView android:id="@id/rv_leak_probes" android:layout_width="fill_parent" android:layout_height="fill_parent" />
+</LinearLayout>

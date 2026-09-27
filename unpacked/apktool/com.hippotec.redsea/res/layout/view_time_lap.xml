@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout android:background="@color/backgroundSecond" android:layout_width="wrap_content" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_12sp" android:textColor="@color/generalBlack" android:id="@id/time_tv" android:layout_width="36.0dip" android:layout_height="wrap_content" android:maxLines="1" android:textAlignment="center" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toTopOf="parent" />
+    <LinearLayout android:id="@id/dots_layout" android:layout_width="wrap_content" android:layout_height="2.0dip" app:layout_constraintBottom_toBottomOf="@id/time_tv" app:layout_constraintStart_toEndOf="@id/time_tv" app:layout_constraintTop_toTopOf="@id/time_tv">
+        <ImageView android:layout_width="0.0dip" android:layout_height="fill_parent" android:src="@drawable/ic_dot" android:layout_weight="1.0" />
+        <ImageView android:layout_width="0.0dip" android:layout_height="fill_parent" android:src="@drawable/ic_dot" android:layout_weight="1.0" />
+        <ImageView android:layout_width="0.0dip" android:layout_height="fill_parent" android:src="@drawable/ic_dot" android:layout_weight="1.0" />
+        <ImageView android:layout_width="0.0dip" android:layout_height="fill_parent" android:src="@drawable/ic_dot" android:layout_weight="1.0" />
+    </LinearLayout>
+    <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_12sp" android:textColor="@color/generalBlack" android:id="@id/end_time" android:visibility="gone" android:layout_width="36.0dip" android:layout_height="wrap_content" android:maxLines="1" android:textAlignment="center" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toEndOf="@id/dots_layout" app:layout_constraintTop_toTopOf="parent" />
+</androidx.constraintlayout.widget.ConstraintLayout>

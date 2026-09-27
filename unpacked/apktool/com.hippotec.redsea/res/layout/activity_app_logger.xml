@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <com.hippotec.redsea.ui.fonted.FontedEditText android:id="@id/et_search" android:layout_width="0.0dip" android:layout_height="wrap_content" android:hint="Search" app:layout_constraintHorizontal_weight="0.7" app:layout_constraintLeft_toLeftOf="parent" app:layout_constraintRight_toLeftOf="@id/search" app:layout_constraintTop_toTopOf="parent" />
+    <com.hippotec.redsea.ui.fonted.FontedButton android:id="@id/search" android:layout_width="0.0dip" android:layout_height="wrap_content" android:text="search" app:layout_constraintHorizontal_weight="0.3" app:layout_constraintLeft_toRightOf="@id/et_search" app:layout_constraintRight_toRightOf="parent" app:layout_constraintTop_toTopOf="parent" />
+    <WebView android:id="@id/webview" android:layout_width="fill_parent" android:layout_height="0.0dip" android:layout_marginTop="@dimen/padding_5dp" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintTop_toBottomOf="@id/search" />
+    <com.google.android.material.floatingactionbutton.FloatingActionButton android:id="@id/top" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_margin="@dimen/padding_5dp" android:src="@drawable/ic_arrow_upward" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintRight_toRightOf="parent" />
+</androidx.constraintlayout.widget.ConstraintLayout>

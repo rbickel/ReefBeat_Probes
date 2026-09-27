@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<com.hippotec.redsea.ui.ClickableRowControl android:id="@id/v_leak_probe_row" android:layout_width="fill_parent" android:layout_height="wrap_content" app:cr_border="bottom" app:cr_img="@drawable/ic_arrow_right_black"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" />

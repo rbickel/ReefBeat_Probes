@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <external-files-path name="images" path="Pictures" />
+    <files-path name="log_files" path="Logs/" />
+    <files-path name="dose_log_files" path="dose-logs/" />
+</paths>

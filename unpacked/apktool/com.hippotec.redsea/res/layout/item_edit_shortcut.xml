@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:background="@color/backgroundSecond" android:layout_width="fill_parent" android:layout_height="@dimen/padding_80dp"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <ImageView android:id="@id/shortcut_icon" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/ic_feeding_shortcuts" android:layout_centerVertical="true" android:layout_marginStart="16.0dip" />
+    <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_17sp" android:textStyle="bold|italic" android:textColor="@color/generalBlack" android:ellipsize="marquee" android:id="@id/text1" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/edit_shortcut_feed" android:layout_toRightOf="@id/shortcut_icon" android:layout_centerVertical="true" android:layout_marginStart="10.0dip" />
+    <ImageView android:id="@id/enter_icon" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginRight="15.0dip" android:src="@drawable/ic_arrow_right_black" android:layout_alignParentRight="true" android:layout_centerVertical="true" />
+    <RelativeLayout android:background="@color/separatorDefault" android:layout_width="fill_parent" android:layout_height="0.5dip" android:layout_alignParentBottom="true" />
+</RelativeLayout>

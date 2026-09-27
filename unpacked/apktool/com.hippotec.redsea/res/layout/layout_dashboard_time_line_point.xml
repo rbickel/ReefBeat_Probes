@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:id="@id/line_slider_layout" android:layout_width="wrap_content" android:layout_height="@dimen/dashboard_timeline_height"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <View android:layout_gravity="center" android:id="@id/time_line_slider" android:background="@color/new_red" android:layout_width="1.0dip" android:layout_height="wrap_content" android:layout_centerHorizontal="true" />
+    <com.hippotec.redsea.ui.fonted.FontedTextView android:textSize="@dimen/text_size_marker_led" android:textStyle="bold" android:textColor="@color/text_opaque_white" android:gravity="center" android:layout_gravity="center" android:id="@id/time_text_view" android:background="@null" android:paddingLeft="5.0dip" android:paddingRight="5.0dip" android:paddingBottom="@dimen/time_text_view_padding_bottom" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textAllCaps="false" />
+</RelativeLayout>

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="dimen_toolbar_margin_item_right">37.0dip</dimen>
+    <dimen name="edit_graph_blue_padding_top">6.0dip</dimen>
+    <dimen name="edit_graph_clouds_padding_top">8.0dip</dimen>
+    <dimen name="edit_graph_leds_layout_padding_top">10.0dip</dimen>
+    <dimen name="edit_graph_white_padding_top">6.0dip</dimen>
+    <dimen name="pump_intensity_container_height">29.0dip</dimen>
+    <dimen name="pump_intensity_container_width">56.0dip</dimen>
+    <dimen name="sign_in_button_height">52.0dip</dimen>
+    <dimen name="sign_in_button_width">280.0dip</dimen>
+    <dimen name="text_size_even_smaller">9.0sp</dimen>
+    <dimen name="text_size_even_smallest">8.0sp</dimen>
+    <dimen name="text_size_large">20.0sp</dimen>
+    <dimen name="text_size_larger_medium">22.299988sp</dimen>
+    <dimen name="text_size_largest">25.0sp</dimen>
+    <dimen name="text_size_marker_led">11.699982sp</dimen>
+    <dimen name="text_size_medium">16.699982sp</dimen>
+    <dimen name="text_size_medium_small">16.0sp</dimen>
+    <dimen name="text_size_medium_smaller">15.299988sp</dimen>
+    <dimen name="text_size_small">13.299988sp</dimen>
+    <dimen name="text_size_small_between">10.699982sp</dimen>
+    <dimen name="text_size_small_bigger">14.0sp</dimen>
+    <dimen name="text_size_smaller">12.0sp</dimen>
+    <dimen name="text_size_smallest">10.0sp</dimen>
+    <dimen name="wide_button_height">43.0dip</dimen>
+    <dimen name="wide_button_width">230.0dip</dimen>
+</resources>

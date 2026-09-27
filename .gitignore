@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+probe_logs/
+.env
+pico/config.py
+calibration.pending
