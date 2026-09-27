@@ -16,8 +16,7 @@ def validate_topics(ph_topic, temperature_topic, temperature_sensor):
 def state_messages(
     telemetry, timestamp,
     ph_topic="reef/sump_ph/state",
-    temperature_topic="reef/tank_main_temp/state",
-    temperature_sensor="ds18b20",
+    temperature_topic="reef/tank_main_temp/state"
 ):
     status = telemetry.get("status")
     if not isinstance(status, str) or status.lower() != "connected":
@@ -30,7 +29,7 @@ def state_messages(
             raise ValueError("Telemetry %s must be finite" % key)
     if not isinstance(timestamp, str) or len(timestamp) != 20 or not timestamp.endswith("Z"):
         raise ValueError("Timestamp must be UTC YYYY-MM-DDTHH:MM:SSZ")
-    validate_topics(ph_topic, temperature_topic, temperature_sensor)
+    validate_topics(ph_topic, temperature_topic, "redsea_ph")
     return [
         (ph_topic, {
             "value": telemetry["value"], "unit": "pH", "sensor": "redsea_ph",
@@ -38,6 +37,6 @@ def state_messages(
         }),
         (temperature_topic, {
             "value": telemetry["temperature_value"], "unit": "\u00b0C",
-            "sensor": temperature_sensor, "id": "tank_main_temp", "ts": timestamp,
+            "sensor": "redsea_ph", "id": "tank_main_temp", "ts": timestamp,
         }),
     ]
