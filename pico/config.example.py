@@ -20,10 +20,10 @@ OVERRIDES = {
     # "calibration_command_ttl": 120,
     # "calibration_settle_seconds": 30,
     # "calibration_marker_path": "calibration.pending",  # Persistent board filesystem.
-    # "wifi_timeout": 60.0,  # Per-attempt association + DHCP budget.
+    # "wifi_timeout": 60.0,  # Per attempt; recovery cycles continue forever.
     # "wifi_disable_power_save": True,  # Mains/USB-powered reliability.
     # "wifi_country": "",  # Your actual two-letter country code; empty keeps firmware default.
-    # "status_led": True,  # Double flash = published; solid = error/retrying.
+    # "status_led": True,  # Fast=start/reconnect, slow=error, heartbeat=healthy.
     # "host": "192.168.50.177",
     # "poll_interval": 60.0,
     # "temperature_sensor": "redsea_ph",  # Use ds18b20 only for legacy consumers.

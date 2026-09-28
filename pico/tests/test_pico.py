@@ -361,6 +361,54 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hardware.clients[0].publications, [])
         self.assertTrue(self.runtime.mqtt_connected())
 
+    async def test_busy_calibration_diagnostics_do_not_ping_for_every_operation(self):
+        self.settings.calibration_enabled = True
+        await self.runtime.prepare()
+        await self.runtime.connect_probe()
+        client = self.hardware.clients[0]
+        initial = client.pings
+        for _ in range(31):
+            await self.runtime.prepare()
+            await self.runtime.read()
+            for topic in ("status", "telemetry", "progress"):
+                await self.runtime.publish("test/" + topic, '{"value":7.0}')
+            self.clock.advance(1)
+        self.assertEqual(client.pings - initial, 2)
+        self.assertEqual(len(client.publications), 93)
+        self.assertTrue(self.runtime.mqtt_connected())
+
+    async def test_calibration_write_checks_broker_even_before_next_heartbeat(self):
+        self.settings.calibration_enabled = True
+        await self.runtime.prepare()
+        await self.runtime.connect_probe()
+        client = self.hardware.clients[0]
+        client.sock.response = None
+        with self.assertRaisesRegex(OSError, "PINGREQ/PINGRESP"):
+            await self.runtime.request("/calibration-enter", {"time": self.runtime.epoch()}, POST)
+        self.assertEqual(self.runtime.writer.writes, [])
+        self.assertFalse(self.runtime.mqtt_connected())
+
+    async def test_scheduled_ping_still_fails_closed_before_read(self):
+        await self.runtime.prepare()
+        await self.runtime.connect_probe()
+        self.clock.advance(pico_runtime.PING_INTERVAL_SECONDS)
+        self.hardware.clients[0].sock.response = None
+        with self.assertRaisesRegex(OSError, "PINGREQ/PINGRESP"):
+            await self.runtime.read()
+        self.assertEqual(self.runtime.writer.writes, [])
+        self.assertFalse(self.runtime.mqtt_connected())
+
+    async def test_rate_limited_prepare_still_receives_commands(self):
+        from test_pico_mqtt import command
+        self.settings.calibration_enabled = True
+        await self.runtime.prepare()
+        client = self.hardware.clients[0]
+        initial = client.pings
+        client.sock.feed(command(b"operator-command"))
+        await self.runtime.prepare()
+        self.assertEqual(await self.runtime.commands(), [(b"operator-command", False)])
+        self.assertEqual(client.pings, initial)
+
     async def test_transport_cleanup_preserves_healthy_wifi_and_synchronized_clock(self):
         await self.runtime.prepare()
         await self.runtime.connect_probe()
@@ -490,38 +538,54 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.hardware.wifi_active)
         self.assertEqual(self.hardware.clients, [])
 
-    async def test_led_double_flash_success_error_persistence_and_stop(self):
+    async def test_led_patterns_repeat_with_distinct_status_timing(self):
         real_sleep = asyncio.sleep
-        waits = []
 
-        async def virtual_sleep(seconds):
-            waits.append(seconds)
-            self.clock.advance(seconds)
-            await real_sleep(0)
+        for event, expected_changes, expected_waits in (
+            ("initializing", [1, 0], [0.1, 0.2]),
+            ("error", [1, 0], [0.5, 1.5]),
+            ("published", [1, 0, 1, 0], [0.1, 0.1, 0.1, 1.2]),
+        ):
+            with self.subTest(event=event):
+                waits = []
+                cycle_complete = asyncio.Event()
+                hold_cycle = asyncio.Event()
 
+                async def virtual_sleep(seconds):
+                    waits.append(seconds)
+                    if len(waits) == len(expected_waits):
+                        cycle_complete.set()
+                        await hold_cycle.wait()
+                    await real_sleep(0)
+
+                self.hardware.led_changes.clear()
+                with patch.object(pico_runtime.asyncio, "sleep", virtual_sleep):
+                    await self.runtime.indicate(event)
+                    await cycle_complete.wait()
+                    self.assertEqual(self.hardware.led_changes, expected_changes)
+                    self.assertEqual(waits, expected_waits)
+                    await self.runtime.indicate("stopped")
+
+    async def test_error_pattern_survives_transport_close_until_status_changes(self):
         await self.runtime.indicate("error")
-        self.assertEqual(self.hardware.led_changes[-1], 1)
+        indicator_task = self.runtime._indicator_task
         await self.runtime.close()
-        self.assertEqual(self.hardware.led_changes[-1], 1)
-        self.hardware.led_changes.clear()
-        with patch.object(pico_runtime.asyncio, "sleep", virtual_sleep):
-            await self.runtime.indicate("published")
-        self.assertEqual(self.hardware.led_changes[:4], [1, 0, 1, 0])
-        self.assertEqual(waits, [0.1] * 4)
-        self.assertEqual(self.hardware.led_changes[-1], 0)
-        await self.runtime.indicate("error")
+        self.assertIs(self.runtime._indicator_task, indicator_task)
+        self.assertEqual(self.runtime._indicator_state, "error")
         await self.runtime.indicate("stopped")
         self.assertEqual(self.hardware.led_changes[-1], 0)
 
-    async def test_led_disabled_and_cancelled_flash_finishes_off(self):
+    async def test_led_disabled_and_stopped_indicator_finishes_off(self):
         self.settings.status_led = False
         without_led = pico_runtime.Runtime(self.settings)
         self.assertIsNone(without_led.led)
-        await without_led.indicate("error")
-        with patch.object(pico_runtime.asyncio, "sleep", new_callable=AsyncMock,
-                          side_effect=asyncio.CancelledError):
-            with self.assertRaises(asyncio.CancelledError):
-                await self.runtime.indicate("published")
+        for event in ("initializing", "error", "ok", "published", "calibrating", "waiting", "stopped"):
+            await without_led.indicate(event)
+        await self.runtime.indicate("published")
+        self.assertIsNotNone(self.runtime._indicator_task)
+        await self.runtime.indicate("stopped")
+        self.assertIsNone(self.runtime._indicator_task)
+        self.assertIsNone(self.runtime._indicator_state)
         self.assertEqual(self.hardware.led_changes[-1], 0)
 
     async def test_early_responses_use_shared_protocol_and_connection_is_reused(self):
@@ -732,6 +796,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_ping_cannot_send_ble_after_exhausting_request_budget(self):
         await self.runtime.prepare()
         await self.runtime.connect_probe()
+        self.clock.advance(pico_runtime.PING_INTERVAL_SECONDS)
         self.settings.request_timeout = 1
         with patch.object(self.runtime, "_ping", side_effect=lambda **kw: self.clock.advance(2)):
             with self.assertRaisesRegex(ProbeError, "timed out"):
@@ -1133,8 +1198,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(readings[self.settings.temperature_topic]["sensor"], "redsea_ph")
         self.assertTrue(any(topic.decode() == self.settings.availability_topic and payload == b"online"
                             for topic, payload, _, _ in messages))
-        self.assertIn([1, 0, 1, 0], [self.hardware.led_changes[i:i + 4]
-                                    for i in range(len(self.hardware.led_changes) - 3)])
+        self.assertIn(1, self.hardware.led_changes)
         self.assertEqual(self.hardware.led_changes[-1], 0)
         marker.set.assert_not_called()
 
@@ -1229,15 +1293,14 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "2024-2099"):
             self.runtime.epoch()
 
-    async def test_calibration_led_indications_do_not_start_background_tasks(self):
-        with patch.object(pico_runtime.asyncio, "sleep", new_callable=AsyncMock) as sleep:
-            await self.runtime.indicate("calibrating")
-            sleep.assert_awaited_once_with(0.1)
-            self.assertEqual(self.hardware.led_changes[-2:], [1, 0])
-            sleep.reset_mock()
-            await self.runtime.indicate("waiting")
-            sleep.assert_awaited_once_with(0.4)
-            self.assertEqual(self.hardware.led_changes[-2:], [1, 0])
+    async def test_calibration_progress_retains_healthy_heartbeat(self):
+        await self.runtime.indicate("calibrating")
+        first_task = self.runtime._indicator_task
+        self.assertEqual(self.runtime._indicator_state, "ok")
+        await self.runtime.indicate("waiting")
+        self.assertEqual(self.runtime._indicator_state, "ok")
+        self.assertIsNot(self.runtime._indicator_task, first_task)
+        await self.runtime.indicate("stopped")
 
     async def test_ntp_failure_or_bad_rtc_does_not_connect_mqtt(self):
         self.hardware.ntp_fails = True

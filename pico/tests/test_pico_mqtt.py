@@ -296,11 +296,13 @@ class MQTTWireTests(unittest.TestCase):
     def test_publish_retention_parameter_and_interleaved_commands(self):
         client, publisher = self.make()
         publisher.connect()
-        client.wire.response = command(b"next") + b"\xd0\0"
+        client.wire.feed(command(b"next"))
+        pings = client.pings
         publisher.publish("event", '{"ok":true}', retain=False)
         self.assertEqual(client.publications, [(b"event", b'{"ok":true}', False, 0)])
         self.assertEqual(publisher.commands(), [(b"next", False)])
         self.assertTrue(publisher.connected)
+        self.assertEqual(client.pings, pings)
 
     def test_outbound_packet_limit_and_topic_wildcards_reject_before_send(self):
         client, publisher = self.make()

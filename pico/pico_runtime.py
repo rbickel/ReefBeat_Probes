@@ -19,6 +19,11 @@ WIFI_STATUS_NAMES = {
     -3: "AUTH_FAILED", -2: "NO_AP_FOUND", -1: "CONNECT_FAILED",
     0: "IDLE", 1: "JOINING", 2: "WAITING_FOR_DHCP", 3: "CONNECTED",
 }
+LED_PATTERNS = {
+    "initializing": ((1, 0.1), (0, 0.2)),
+    "error": ((1, 0.5), (0, 1.5)),
+    "ok": ((1, 0.1), (0, 0.1), (1, 0.1), (0, 1.2)),
+}
 GET_TELEMETRY = request_packets(GET, "/telemetry", mtu=23)[0]
 READ_PATHS = ("/firmware", "/telemetry", "/config", "/calibration-status", "/calibration-log")
 WRITE_PATHS = ("/calibration-enter", "/calibration-point-start", "/calibration-exit")
@@ -133,6 +138,8 @@ class Runtime:
         if settings.status_led:
             from machine import Pin
             self.led = Pin("LED", Pin.OUT, value=0)
+        self._indicator_task = None
+        self._indicator_state = None
         self._wifi_pm_configured = False
         self._wifi_ready_logged = False
         self._wifi_country_applied = False
@@ -160,28 +167,51 @@ class Runtime:
     def report(self, level, message):
         print("[pico]", level, message)
 
+    async def _indicator_loop(self, pattern):
+        index = 0
+        try:
+            while True:
+                await asyncio.sleep(pattern[index][1])
+                index = (index + 1) % len(pattern)
+                self.led.value(pattern[index][0])
+        except asyncio.CancelledError:
+            raise
+        except self.errors as exc:
+            self.report("error", "Status LED task failed: " + describe_error(exc))
+        finally:
+            try:
+                self.led.off()
+            except self.errors as exc:
+                self.report("error", "Status LED shutdown failed: " + describe_error(exc))
+
+    async def _stop_indicator(self):
+        task, self._indicator_task = self._indicator_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     async def indicate(self, event):
         if self.led is None:
             return
-        if event == "error":
-            self.led.on()
-        elif event == "stopped":
+        if event == "stopped":
+            self._indicator_state = None
+            await self._stop_indicator()
             self.led.off()
-        elif event == "published":
-            try:
-                for value in (1, 0, 1, 0):
-                    self.led.value(value)
-                    await asyncio.sleep(0.1)
-            finally:
-                self.led.off()
-        elif event in ("calibrating", "waiting"):
-            try:
-                self.led.on()
-                await asyncio.sleep(0.1 if event == "calibrating" else 0.4)
-            finally:
-                self.led.off()
+            return
+        if event in ("published", "ok", "calibrating", "waiting"):
+            state = "ok"
+        elif event in ("initializing", "error"):
+            state = event
         else:
             raise ValueError("Unknown status LED event: " + event)
+        await self._stop_indicator()
+        self._indicator_state = state
+        pattern = LED_PATTERNS[state]
+        self.led.value(pattern[0][0])
+        self._indicator_task = asyncio.create_task(self._indicator_loop(pattern))
 
     def mqtt_connected(self):
         return bool(self.wlan.isconnected() and self.publisher and self.publisher.connected)
@@ -277,7 +307,7 @@ class Runtime:
             self.wlan.active(True)
             self._wifi_pm_configured = False
             self._configure_wifi_power()
-            self.report("info", "WiFi connecting; allowing %ss for association and DHCP"
+            self.report("info", "WiFi connection attempt; allowing %ss for association and DHCP"
                         % cfg.wifi_timeout)
             self.wlan.connect(cfg.wifi_ssid, cfg.wifi_password)
             start = self.ticks()
@@ -294,7 +324,7 @@ class Runtime:
                 if status == -3:
                     raise OSError("WiFi AUTH_FAILED (-3); check credentials/security mode")
                 if elapsed >= cfg.wifi_timeout:
-                    raise OSError("WiFi connection timed out after %ss: %s (%s)"
+                    raise OSError("WiFi connection timed out for this attempt after %ss: %s (%s)"
                                   % (cfg.wifi_timeout, label, status))
                 await asyncio.sleep(min(0.25, cfg.wifi_timeout - elapsed))
             self._log_wifi_ready()

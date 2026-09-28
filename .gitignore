@@ -1,8 +1,10 @@
 .venv/
 __pycache__/
 probe_logs/
+firmware_downloads/
 .env
 pico/config.py
 calibration.pending
+firmware_update.pending
 unpacked/
 ReefBeat_8.1.7_APKPure.xapk

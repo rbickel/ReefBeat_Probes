@@ -393,7 +393,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         runtime.close.assert_awaited_once()
         runtime.read.assert_awaited_once()
         self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],
-                         ["published", "stopped"])
+                         ["initializing", "ok", "published", "stopped"])
 
     async def test_common_start_to_start_schedule(self):
         runtime = self.runtime()
@@ -413,7 +413,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertTrue(runtime.close.await_count >= 1)
         self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],
-                         ["error", "error"])
+                         ["initializing", "ok", "error", "error"])
 
     async def test_unexpected_publish_error_surfaces_and_leaves_error_indicator(self):
         runtime = self.runtime()
@@ -423,7 +423,8 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         runtime.read.assert_awaited_once()
         runtime.close.assert_awaited_once()
         runtime.sleep.assert_not_awaited()
-        runtime.indicate.assert_awaited_once_with("error")
+        self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],
+                         ["initializing", "ok", "error"])
         self.assertTrue(all(
             call.args == (app.AVAILABILITY_TOPIC, "offline")
             for call in runtime.publish.await_args_list
@@ -437,7 +438,8 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(interruption):
                     await app.run_bridge(app.Settings(), runtime, asyncio.Event())
                 runtime.close.assert_awaited_once()
-                runtime.indicate.assert_awaited_once_with("stopped")
+                self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],
+                                 ["initializing", "ok", "stopped"])
 
     async def test_common_retry_backoff_is_bounded_and_interruptible(self):
         runtime = self.runtime()
@@ -454,6 +456,80 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         await app.run_bridge(app.Settings(retry_min=5, retry_max=15), runtime, stop)
         self.assertEqual(waits, [5, 10, 15, 15, 15])
         runtime.read.assert_not_awaited()
+
+    async def test_calibration_monitoring_resets_backoff_after_successful_sample(self):
+        runtime = self.runtime()
+        runtime.epoch.return_value = 1800000000
+        runtime.commands = AsyncMock(return_value=[])
+        attempts = 0
+        waits = []
+        stop = asyncio.Event()
+
+        async def connect():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise OSError("probe unavailable")
+
+        async def sleep(seconds, _stop, monitor_probe=False):
+            if monitor_probe:
+                raise OSError("MQTT heartbeat timed out")
+            waits.append(seconds)
+            if len(waits) == 4:
+                stop.set()
+
+        runtime.connect_probe.side_effect = connect
+        runtime.sleep.side_effect = sleep
+        with patch("reef_calibration.PendingMarker") as marker:
+            marker.return_value.exists.return_value = False
+            await app.run_bridge(app.Settings(calibration_enabled=True), runtime, stop)
+        self.assertEqual(waits, [5, 10, 5, 5])
+        self.assertEqual(runtime.read.await_count, 2)
+        self.assertEqual(sum(call.args == (app.AVAILABILITY_TOPIC, "online")
+                             for call in runtime.publish.await_args_list), 2)
+
+    async def test_wifi_or_probe_outage_recovers_after_more_than_three_hours(self):
+        failures = 183
+        for failed_stage in ("prepare", "connect_probe"):
+            with self.subTest(failed_stage=failed_stage):
+                runtime = self.runtime()
+                stop = asyncio.Event()
+                attempts = 0
+                retry_waits = []
+
+                async def fail_then_recover():
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts <= failures:
+                        raise OSError(failed_stage + " unavailable")
+
+                async def read_then_stop():
+                    stop.set()
+                    return SAMPLE
+
+                async def sleep(seconds, _stop, monitor_probe=False):
+                    if not monitor_probe:
+                        retry_waits.append(seconds)
+
+                getattr(runtime, failed_stage).side_effect = fail_then_recover
+                runtime.read.side_effect = read_then_stop
+                runtime.sleep.side_effect = sleep
+
+                await app.run_bridge(
+                    app.Settings(retry_min=5, retry_max=60), runtime, stop
+                )
+
+                successful_attempts = 2 if failed_stage == "prepare" else 1
+                self.assertEqual(attempts, failures + successful_attempts)
+                self.assertEqual(len(retry_waits), failures)
+                self.assertGreater(sum(retry_waits), 3 * 60 * 60)
+                self.assertEqual(retry_waits[-1], 60)
+                runtime.read.assert_awaited_once()
+                self.assertTrue(any(
+                    "retries continue until stopped" in call.args[1]
+                    for call in runtime.report.call_args_list
+                    if call.args[0] == "info"
+                ))
 
     async def test_common_no_credentials_or_platform_imports_in_configuration(self):
         settings = app.Settings()
@@ -478,7 +554,12 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_led_failure_is_logged_without_retrying_an_already_published_sample(self):
         runtime = self.runtime()
-        runtime.indicate.side_effect = [OSError("LED unavailable"), None]
+
+        async def indicate(event):
+            if event == "published":
+                raise OSError("LED unavailable")
+
+        runtime.indicate.side_effect = indicate
         await app.run_bridge(app.Settings(), runtime, asyncio.Event(), once=True)
         runtime.read.assert_awaited_once()
         self.assertTrue(any("Status LED failed" in str(call)

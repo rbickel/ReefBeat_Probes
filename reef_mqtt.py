@@ -197,7 +197,7 @@ async def calibration_loop(settings, runtime, stop, calibration):
 
 
 async def run_bridge(settings, runtime, stop, once=False):
-    """The sole sampling, scheduling, validation, publication and retry loop."""
+    """Run until stopped, retrying transport failures without an attempt limit."""
     retry = settings.retry_min
     from reef_calibration import Calibration, PendingMarker
     marker = PendingMarker(settings.calibration_marker_path)
@@ -212,6 +212,7 @@ async def run_bridge(settings, runtime, stop, once=False):
     finished = False
     try:
         while not stop.is_set():
+            await indicate(runtime, "initializing")
             stage = "prepare WiFi/time/MQTT"
             try:
                 await runtime.prepare()
@@ -220,6 +221,7 @@ async def run_bridge(settings, runtime, stop, once=False):
                     await calibration.announce(runtime)
                 stage = "connect and subscribe BLE"
                 await runtime.connect_probe()
+                await indicate(runtime, "ok")
                 runtime.report("info", "Poll interval: %.1fs" % settings.poll_interval)
                 if calibration is not None:
                     stage = "calibration/monitoring service"
@@ -257,7 +259,7 @@ async def run_bridge(settings, runtime, stop, once=False):
                 await close_runtime(runtime)
                 if once:
                     raise
-                runtime.report("info", "Retrying in %.1fs" % retry)
+                runtime.report("info", "Retrying in %.1fs; retries continue until stopped" % retry)
                 await runtime.sleep(retry, stop)
                 retry = min(settings.retry_max, retry * 2)
         finished = True

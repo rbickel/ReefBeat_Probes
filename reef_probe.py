@@ -77,6 +77,7 @@ class Probe:
         self.mtu = 23
 
     def on_disconnect(self, _client: BleakClient) -> None:
+        del _client
         self.disconnected.set()
         try:
             self.trace.record("disconnected")
@@ -165,6 +166,11 @@ class Probe:
             method == POST and self.allow_calibration and path in CALIBRATION_PATHS
         ):
             raise ProbeError("Calibration writes require explicit confirmation.")
+        return await self._exchange(path, payload, method=method)
+
+    async def _exchange(
+        self, path: str, payload: dict[str, object] | None = None, *, method: int = GET
+    ) -> dict[str, object]:
         async with self.lock:
             if self.broken:
                 raise ProbeError("Previous exchange failed; reconnect before any more commands.")
@@ -204,7 +210,7 @@ class Probe:
                                 self.broken = False
                                 raise
                             if method == POST and result.get("success") is not True:
-                                raise ProbeError("Calibration command lacks explicit success=true.", result)
+                                raise ProbeError("POST command lacks explicit success=true.", result)
                             self.trace.record("response", path=path, data=result)
                             self.broken = False
                             return result

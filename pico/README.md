@@ -185,10 +185,15 @@ argument. Preserve the board's credentials and any `calibration.pending` marker.
 - `prepare()` reuses healthy WiFi/MQTT connections and synchronizes NTP only
   when needed, not each successful poll. Each WiFi association/DHCP attempt is
   capped by `wifi_timeout` (default 60 seconds), after a one-second reset pause.
-  Failed attempts explicitly cancel the RP2 controller's indefinite retry.
+  This is only a per-attempt safety timeout, not a lifetime connection timeout:
+  the shared bridge retries WiFi, MQTT, and probe connections forever, with no
+  attempt limit, until the process is explicitly stopped. Failed WiFi attempts
+  reset the RP2 controller before the next recovery cycle so a wedged controller
+  retry cannot prevent later recovery.
   A transient `NO_AP_FOUND`/`CONNECT_FAILED` can recover within that budget;
   `AUTH_FAILED` ends the attempt promptly with a specific error. The shared
-  publisher applies its existing 5-to-60-second retry backoff.
+  bridge applies its existing 5-to-60-second retry backoff and continues at the
+  maximum delay during an outage, allowing service to recover after hours or days.
   Healthy WLAN and the synchronized clock survive BLE/MQTT cleanup; only WiFi
   reconnection resets WLAN. Even normal shutdown leaves WiFi available for Thonny.
   Status changes and ten-second progress messages distinguish association from DHCP.
@@ -287,21 +292,20 @@ The Pico W's named `Pin("LED")` is used, not GPIO 25:
 
 | Pattern | Meaning |
 | --- | --- |
-| Two short flashes (100 ms on/off) | Both measurement states and `online` were sent to MQTT |
-| One short flash (100 ms) | Calibration progress indication |
-| One slow flash (400 ms) | Calibration operator-wait indication |
-| Solid on | A bridge error occurred; remains on during retry/recovery or after a fatal loop error |
-| Off | Normal waiting between successful polls, startup, or normal stop |
+| Fast single blink (100 ms on, 200 ms off) | Initializing at startup or reconnecting after an error |
+| Slow single blink (500 ms on, 1.5 s off) | WiFi, MQTT, BLE, probe, or bridge error; retry is pending |
+| Heartbeat double blink (100 ms on/off/on, then 1.2 s pause) | WiFi, MQTT, and BLE are connected and no error is active |
+| Off | Normal stop or status LED disabled |
 
-The next successful publish clears the error indication with the double flash.
-Ctrl-C/shutdown turns the LED off. A fatal loop error still prints its traceback
-and stops the application, but cleanup leaves the error LED on. Errors before
-the runtime/LED is initialized cannot be indicated this way.
-Since MQTT uses QoS 0, a success pattern means
-the transport accepted/sent the messages, not proof that Home Assistant processed
-them. A partial two-topic publish never triggers a success pattern. No separate
-permanent blink task is needed, and failed LED writes are logged without replaying
-an already published measurement.
+The selected pattern repeats continuously. Startup and every reconnect use the
+fast pattern, errors use the slow pattern throughout retry backoff, and a
+successful transport connection starts the heartbeat. Calibration progress and
+operator-wait states retain the healthy heartbeat; calibration or transport
+failures switch to the error pattern. Ctrl-C/shutdown turns the LED off.
+Errors before the runtime/LED is initialized cannot be indicated this way.
+Since MQTT uses QoS 0, the heartbeat means that the bridge transports are healthy,
+not proof that Home Assistant processed the latest messages. Failed LED writes
+are logged without replaying an already published measurement.
 
 To customize, merge these keys into the board's existing `config.py` `OVERRIDES`;
 do not replace WiFi/MQTT credentials:
@@ -309,7 +313,7 @@ do not replace WiFi/MQTT credentials:
 ```python
 OVERRIDES = {
     "mqtt_timeout": 3.0,
-    "wifi_timeout": 60.0,
+    "wifi_timeout": 60.0,  # Per attempt; recovery cycles continue forever.
     "wifi_disable_power_save": True,
     "status_led": True,
     # "wifi_country": "...",  # Replace with your actual two-letter country code.

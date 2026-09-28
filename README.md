@@ -1,9 +1,12 @@
 # ReefSense pH probe diagnostics
 
 Experimental Python 3.11+ / Bleak client reconstructed from ReefBeat 8.1.7.
-No ReefControl, ReefBeat account, cloud calls, USB data access, resets, firmware
-updates, or arbitrary command interface. **Direct firmware/configuration and pH
-telemetry reads have been tested on one user's probe (firmware 1.1.2).
+The BLE diagnostics and MQTT bridge use no ReefControl, ReefBeat account, cloud
+calls, USB data access, resets, firmware updates, or arbitrary command interface.
+The separate opt-in firmware downloader described below only retrieves cloud
+metadata/image bytes; it does not flash the probe. **Direct
+firmware/configuration and pH telemetry reads have been tested on one user's
+probe (firmware 1.1.2).
 Calibration and measurement accuracy remain unverified.** This does not establish
 compatibility with every hardware revision or independently prove pairing history.
 
@@ -359,18 +362,138 @@ then independently verify the installed version:
   --address AA:BB:CC:DD:EE:FF --samples 1
 ```
 
-The supplied probe currently reports `1.1.2`; this repository cannot determine
-the current cloud version without an authenticated ReefBeat session. If the app
-offers no update, do not flash merely because the probe is recent.
+The supplied probe currently reports `1.1.2`. An authenticated ReefBeat cloud
+check on 2026-09-28 reported `1.1.8` as the latest `reef-sense-ph` firmware for
+board `esp32` and framework `i`. This is a dated observation; the cloud result
+may change. A newer version being available does not by itself make the
+unvalidated manual flashing path safe.
 
-A manual CPython updater is feasible, but it should not be enabled until one
-official update has been observed end to end and its exact target, image size,
-hash, BLE responses, reboot behavior and recovery options have been recorded.
-Any future updater should be a separate, explicit command using a locally
-supplied image, require target/version/hash confirmation and stable power, never
-auto-retry a partial flash, and reconnect to verify `/firmware` before claiming
-success. Pico flashing should remain out of scope until the Linux path has been
-validated on replaceable hardware.
+### Authenticated firmware check and download
+
+[reef_firmware.py](reef_firmware.py) reproduces only the app's HTTPS login,
+latest-version lookup and raw-image download. These requests contain no probe,
+ReefControl or aquarium identifier, so the probe does not need to have been
+paired with the ReefBeat account. The script performs no BLE scan, connection or
+FOTA operation.
+
+Run it yourself in an interactive terminal. Do not put the password on the
+command line, in `.env`, or in chat:
+
+```bash
+# Prompts once for ReefBeat email and password; prints only version information.
+.venv/bin/python reef_firmware.py check --current-version 1.1.2
+
+# Downloads only when the cloud version is newer than 1.1.2.
+.venv/bin/python reef_firmware.py download --current-version 1.1.2
+```
+
+The 8.1.7 APK and public Red Sea material inspected on 2026-09-28 exposed no
+firmware changelog or release-notes endpoint. The app's download request does
+send an explicit desired-version header, but the current server does not honor
+it for this probe. A request for `1.1.3` returned the exact `1.1.8` bytes:
+SHA-256 `25e1a3ee09f3c92821a20c650b2e8cd7cda344eb3687b94de0608cb28087dd46`.
+The ESP-IDF descriptor identifies project `ReefSensorPh`, version `1.1.8`,
+compiled 2026-08-24 11:54:29 with IDF 5.4.0.
+
+The downloader now parses that embedded descriptor before writing files and
+rejects requested/embedded version mismatches. Historical `1.1.3` therefore
+cannot be retrieved through the app's current endpoint; the earlier file named
+as `1.1.3` is a mislabeled, byte-identical duplicate of `1.1.8`, not evidence of
+an archived `1.1.3` build.
+
+The password and returned bearer token remain in process memory and are never
+written or printed. The app's OAuth client authorization is read at runtime from
+the locally extracted APK at
+`unpacked/apktool/com.hippotec.redsea/smali_classes2/h5/g.smali`; it is not copied
+into this source tree. Authentication is attempted once, with no automatic
+retry that could contribute to an account lockout.
+
+Downloads go to the ignored `firmware_downloads/` directory. The directory must
+be mode `700`; the `.bin` image and JSON metadata are created with mode `600`
+and never overwritten. Metadata contains image size, MD5 (matching the app's
+FOTA protocol) and SHA-256, but no email, password, OAuth client authorization
+or bearer token. If the cloud and probe versions are equal, use
+`--allow-non-newer` only when intentionally archiving that exact image:
+
+```bash
+.venv/bin/python reef_firmware.py download --current-version 1.1.2 \
+  --allow-non-newer
+```
+
+Downloading an image does not establish that it is safe to flash. Keep the
+manual FOTA prerequisites and post-reboot `/firmware` verification requirements
+below.
+
+### Direct BLE firmware update (dangerous, hardware-untested)
+
+[reef_firmware_update.py](reef_firmware_update.py) reproduces the APK's direct
+BLE FOTA sequence for Linux/BlueZ. **No real probe has been flashed with this
+implementation. There is no validated resume, rollback, bootloader recovery or
+unbrick procedure. A failure after the start packet can make the probe
+unusable.**
+
+The updater validates the private image/metadata files, SHA-256, MD5, embedded
+ESP-IDF project/version, probe `chip_revision`, installed version and negotiated
+ATT MTU before allowing FOTA. It then performs the app sequence:
+
+1. connect and negotiate at least MTU 512;
+2. read `/firmware` and require the expected `RSSENSORPH` probe on `1.1.2`;
+3. POST `/time` with Unix seconds and local timezone minutes;
+4. send the MD5/size start packet and require its ACK;
+5. send 504-byte chunks with descending indices without retry;
+6. send terminal index zero a second time and require the completion ACK;
+7. disconnect, wait ten seconds, reconnect and require `/firmware` version
+   `1.1.8` before reporting success.
+
+The pinned Bleak BlueZ backend has no public MTU exchange API, so this updater
+isolates its checked `_acquire_mtu()` dependency and refuses to proceed if that
+API is missing or negotiates less than 512. This dependency must be reverified
+when changing the pinned Bleak version.
+
+First stop the Pi/PC/Pico publisher, close ReefBeat and every other BLE client,
+and keep the probe's ReefSense USB-C adapter on stable power. Run the read-only
+preflight using the exact address discovered by `reef_probe.py scan`:
+
+```bash
+.venv/bin/python reef_firmware_update.py preflight \
+  --image firmware_downloads/reef-sense-ph_1.1.8_esp32_i.bin \
+  --address AA:BB:CC:DD:EE:FF
+```
+
+Preflight must report image `1.1.8`, probe `1.1.2`, chip `RSSENSORPH`, MTU at
+least 512, and 1,948 FOTA data packets. It sends no `/time` or FOTA packet.
+Inspect its new local JSONL log before deciding to continue.
+
+On 2026-09-28, the real probe `RS_PH-91D` passed this preflight: the Linux
+adapter negotiated MTU 512 and the only application request was read-only GET
+`/firmware`, which returned version `1.1.2`, framework `5.4.0` and chip
+`RSSENSORPH`. The validated image was `ReefSensorPh` `1.1.8`, 981,632 bytes,
+split into 1,948 data packets. See the
+[preflight trace](probe_logs/20260928T085446_668702_preflight_firmware.jsonl).
+No `/time`, FOTA start, data or final packet was sent. This validates
+prerequisites, not real flashing or recovery.
+
+Only after a clean preflight, the hardware-untested flash command is:
+
+```bash
+.venv/bin/python reef_firmware_update.py flash \
+  --image firmware_downloads/reef-sense-ph_1.1.8_esp32_i.bin \
+  --address AA:BB:CC:DD:EE:FF
+```
+
+It requires an interactive Linux terminal and the exact confirmations
+`BRIDGE STOPPED POWER STABLE` and `FLASH 1.1.8 NO RECOVERY`. Ctrl-C is ignored
+between the FOTA start and completion ACK; SIGTERM is deferred there as well.
+Before start, the updater creates ignored mode-`600` `firmware_update.pending`.
+It removes that marker only after reconnecting and reading version `1.1.8`.
+If any write, ACK, timeout, disconnect, process crash or post-update verification
+fails, the marker remains, later flash attempts are blocked, and the image is
+never resent automatically. Keep power connected and run read-only `preflight`;
+if the probe already reports `1.1.8`, preflight clears the marker. Host power
+loss and probe power loss cannot be protected against.
+
+Do not use the Pico for the first update attempt. Pico flashing remains out of
+scope until this Linux path is successfully verified on real hardware.
 
 ## MQTT-guided calibration (opt-in, experimental)
 
@@ -875,8 +998,9 @@ for this implementation.** Earlier live measurement-only tests are recorded abov
 
 Pico WiFi now retains a healthy connection through MQTT/BLE recovery, allows a
 configurable 60-second join/DHCP attempt, and logs status/IP/RSSI. The onboard LED
-double-flashes after a published sample, stays on during error retries, and turns
-off on shutdown. See [Pico WiFi and LED options](pico/README.md#onboard-led).
+fast-blinks during startup/reconnect, slow-blinks during errors and continuously
+double-blinks like a heartbeat while healthy. It turns off on shutdown. See
+[Pico WiFi and LED options](pico/README.md#onboard-led).
 The shared settings are accepted on Linux, but its adapter does not drive GPIO.
 
 ## Reverse-engineering reference points
