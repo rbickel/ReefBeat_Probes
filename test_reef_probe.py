@@ -460,6 +460,125 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.request.await_count, 1)
 
 
+class FactoryCalibrationResetTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.probe = make_probe()
+        self.probe.allow_calibration_reset = True
+        self.probe.client.address = "AA:BB:CC:DD:EE:FF"
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.backup = Path(self.directory.name) / "backup.json"
+        self.before = {
+            "ph_ref": 7, "mv_ref": 9, "slope_low": -59.16, "slope_high": -59.16,
+            "factory_ph_ref": 7, "factory_mv_ref": 2,
+            "factory_slope_low": -58.91, "factory_slope_high": -59.0,
+            "temp_offset": 0,
+        }
+        self.after = {**self.before, **{field: self.before[factory]
+                                      for field, factory in rp.FACTORY_PH_FIELDS.items()}}
+        self.config_reads = 0
+        self.reset_error = None
+
+        async def request(path, payload=None, *, method=rp.GET):
+            if method == rp.POST:
+                self.assertEqual(path, rp.CALIBRATION_RESET_PATH)
+                self.assertIsNone(payload)
+                self.assertEqual(json.loads(self.backup.read_text())["config"], self.before)
+                if self.reset_error is not None:
+                    raise self.reset_error
+                return {"success": True, "message": "Factory calibration restored"}
+            if path == "/telemetry":
+                return dict(TELEMETRY)
+            if path == "/firmware":
+                return {"version": "offline-test"}
+            if path == "/config":
+                self.config_reads += 1
+                return self.before if self.config_reads == 1 else self.after
+            if path == "/calibration-log":
+                return {"point": payload["point"], "entries": []}
+            self.fail("Unexpected request: " + path)
+
+        self.probe.request = AsyncMock(side_effect=request)
+
+    def writes(self):
+        return [call for call in self.probe.request.await_args_list
+                if call.kwargs.get("method") == rp.POST]
+
+    async def test_backup_before_single_reset_and_complete_readback(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            await rp.reset_factory_calibration(self.probe, self.backup)
+        self.assertEqual(len(self.writes()), 1)
+        self.assertEqual(self.config_reads, 2)
+        backup = json.loads(self.backup.read_text())
+        self.assertEqual(backup["calibration_history"]["mid"]["point"], "mid")
+        self.assertEqual(backup["calibration_history"]["high"]["point"], "high")
+        self.assertTrue(any(call.args == ("calibration_reset_verified",)
+                            for call in self.probe.trace.record.call_args_list))
+
+    async def test_calibrating_probe_is_not_reset(self):
+        self.probe.request.side_effect = None
+        self.probe.request.return_value = {**TELEMETRY, "status": "calibration"}
+        with self.assertRaisesRegex(rp.ProbeError, "status=connected"):
+            await rp.reset_factory_calibration(self.probe, self.backup)
+        self.assertEqual(self.writes(), [])
+
+    async def test_unverifiable_factory_values_prevent_reset(self):
+        self.before["factory_mv_ref"] = None
+        with self.assertRaisesRegex(rp.ProbeError, "factory_mv_ref"):
+            await rp.reset_factory_calibration(self.probe, self.backup)
+        self.assertEqual(self.writes(), [])
+
+    async def test_existing_backup_is_not_overwritten_and_no_reset_is_sent(self):
+        self.backup.write_text("previous backup")
+        with self.assertRaises(FileExistsError):
+            await rp.reset_factory_calibration(self.probe, self.backup)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.backup.read_text(), "previous backup")
+
+    async def test_ambiguous_reset_is_never_repeated(self):
+        self.reset_error = TimeoutError("response lost")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(TimeoutError):
+                await rp.reset_factory_calibration(self.probe, self.backup)
+        self.assertEqual(len(self.writes()), 1)
+        self.assertIn("Do not repeat", errors.getvalue())
+        self.assertEqual(self.config_reads, 1)
+
+    async def test_acknowledgement_without_restored_coefficients_is_not_success(self):
+        self.after["mv_ref"] = 9
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(rp.ProbeError, "verification failed for mv_ref"):
+                await rp.reset_factory_calibration(self.probe, self.backup)
+        self.assertEqual(len(self.writes()), 1)
+        self.assertFalse(any(call.args == ("calibration_reset_verified",)
+                             for call in self.probe.trace.record.call_args_list))
+
+    async def test_permission_does_not_allow_general_reset_or_arbitrary_config_writes(self):
+        probe = make_probe(allow_calibration=True)
+        with self.assertRaises(rp.ProbeError):
+            await probe.request(rp.CALIBRATION_RESET_PATH, method=rp.POST)
+        probe.allow_calibration_reset = True
+        for method, path, payload in (
+            (rp.GET, rp.CALIBRATION_RESET_PATH, None),
+            (rp.POST, rp.CALIBRATION_RESET_PATH, {}),
+            (rp.POST, "/factory-reset", None),
+            (rp.GET, "/factory-reset", None),
+            (rp.POST, "/config", {"mv_ref": 2}),
+        ):
+            with self.subTest(path=path, method=method), self.assertRaises(rp.ProbeError):
+                await probe.request(path, payload, method=method)
+        probe.client.write_gatt_char.assert_not_awaited()
+        probe._exchange = AsyncMock(return_value={"success": True})
+        self.assertEqual(await probe.request(rp.CALIBRATION_RESET_PATH, method=rp.POST), {"success": True})
+        probe._exchange.assert_awaited_once_with(rp.CALIBRATION_RESET_PATH, method=rp.POST)
+
+    async def test_reset_helper_without_explicit_authorization_refuses_all_io(self):
+        self.probe.allow_calibration_reset = False
+        with self.assertRaisesRegex(rp.ProbeError, "not explicitly authorized"):
+            await rp.reset_factory_calibration(self.probe, self.backup)
+        self.probe.request.assert_not_awaited()
+
+
 class DiscoveryAndCliTests(unittest.TestCase):
     def test_explicit_selection_and_ambiguity(self):
         first = advertisement()
@@ -485,10 +604,19 @@ class DiscoveryAndCliTests(unittest.TestCase):
             ["read", "--address", "AA", "--interval", "-1"],
             ["exit-calibration", "--address", "AA"],
             ["read", "--address", "AA", "--confirm-calibration"],
+            ["reset-calibration", "--address", "AA"],
+            ["reset-calibration", "--address", "AA", "--confirm-calibration"],
         ):
             with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     rp.parse_args(arguments)
+
+    def test_calibration_reset_has_separate_confirmation(self):
+        args = rp.parse_args(["reset-calibration", "--address", "AA",
+                              "--confirm-factory-calibration-reset"])
+        self.assertTrue(args.confirm_factory_calibration_reset)
+        self.assertFalse(args.confirm_calibration)
+        self.assertFalse(rp.parse_args(["read", "--address", "AA"]).confirm_factory_calibration_reset)
 
     def test_logs_are_jsonl_and_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:

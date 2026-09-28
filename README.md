@@ -1,8 +1,9 @@
 # ReefSense pH probe diagnostics
 
 Experimental Python 3.11+ / Bleak client reconstructed from ReefBeat 8.1.7.
-The BLE diagnostics and MQTT bridge use no ReefControl, ReefBeat account, cloud
-calls, USB data access, resets, firmware updates, or arbitrary command interface.
+The ordinary BLE diagnostics and MQTT bridge use no ReefControl, ReefBeat account,
+cloud calls, USB data access, device resets, or arbitrary command interface.
+The Linux CLI has a separately confirmed calibration-only factory reset described below.
 The separate opt-in firmware downloader described below only retrieves cloud
 metadata/image bytes; it does not flash the probe. **Direct
 firmware/configuration and pH telemetry reads have been tested on one user's
@@ -1047,8 +1048,41 @@ If exit was not confirmed, reconnect and explicitly request exit:
 ```
 
 This exits calibration; it does not restore earlier coefficients. History logs
-are diagnostic evidence, not a guaranteed restorable backup. No factory reset,
-calibration reset, offset override, or firmware flashing is implemented.
+are diagnostic evidence, not a guaranteed restorable backup.
+
+### Explicit factory calibration restore (Linux CLI only)
+
+The app's `POST /calibration-factory-reset` is distinct from `/factory-reset`
+and firmware updates. It has no coefficient payload: do not attempt to overwrite
+the `factory_*` fields or POST a copied `/config` object.
+
+Stop the Pico/Linux publisher and any phone BLE client first. Keep the probe
+powered, disable measurement-based dosing/control, and finish any active
+calibration/recovery workflow before using:
+
+```bash
+.venv/bin/python reef_probe.py reset-calibration \
+  --address AA:BB:CC:DD:EE:FF --confirm-factory-calibration-reset
+```
+
+This permission is independent of `--confirm-calibration`; ordinary reads and
+the MQTT bridge cannot invoke it. The command requires normal connected
+telemetry, reads firmware/configuration and both point histories, and writes a
+new flushed/fsynced JSON backup before any reset. `--backup` and `--log` select
+new paths; existing files are never overwritten. It sends the reset once,
+requires explicit `success: true`, then verifies all four pH coefficients against
+the pre-reset factory fields and checks normal telemetry. Any missing field,
+backup failure or active calibration prevents the write. An ambiguous outcome
+is never automatically retried; inspect configuration read-only before deciding
+what to do next.
+
+Live verification on 2026-09-28, firmware 1.1.8: the authorized reset restored
+`ph_ref=7`, `mv_ref=2`, `slope_low=-58.91`, and `slope_high=-59`; a separate
+read-only reconnection confirmed the values and no active calibration session.
+Temperature settings and firmware version were unchanged in that test. This
+does not establish all reset side effects on every firmware or certify measurement
+accuracy: the probe still reported approximately pH 10.21 afterward.
+The reset is not exposed over MQTT and never clears a bridge safety marker.
 
 ## Offline tests
 

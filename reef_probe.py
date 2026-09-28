@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import struct
 import sys
 import time
@@ -33,6 +34,11 @@ READ_PATHS = {
 }
 CALIBRATION_PATHS = {
     "/calibration-enter", "/calibration-point-start", "/calibration-exit"
+}
+CALIBRATION_RESET_PATH = "/calibration-factory-reset"
+FACTORY_PH_FIELDS = {
+    "ph_ref": "factory_ph_ref", "mv_ref": "factory_mv_ref",
+    "slope_low": "factory_slope_low", "slope_high": "factory_slope_high",
 }
 T = TypeVar("T")
 
@@ -63,12 +69,14 @@ class Trace:
 
 class Probe:
     def __init__(
-        self, client: BleakClient, trace: TraceRecorder, timeout: float, allow_calibration: bool
+        self, client: BleakClient, trace: TraceRecorder, timeout: float, allow_calibration: bool,
+        *, allow_calibration_reset: bool = False,
     ):
         self.client = client
         self.trace = trace
         self.timeout = timeout
         self.allow_calibration = allow_calibration
+        self.allow_calibration_reset = allow_calibration_reset
         self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
         self.disconnected = asyncio.Event()
         self.callback_error: ProbeError | OSError | None = None
@@ -160,6 +168,10 @@ class Probe:
     async def request(
         self, path: str, payload: dict[str, object] | None = None, *, method: int = GET
     ) -> dict[str, object]:
+        if path == CALIBRATION_RESET_PATH:
+            if not self.allow_calibration_reset or method != POST or payload is not None:
+                raise ProbeError("Factory calibration reset requires its own explicit confirmation and no payload.")
+            return await self._exchange(path, method=POST)
         if method == GET and path not in READ_PATHS:
             raise ProbeError("This diagnostic does not allow that read endpoint.")
         if method != GET and not (
@@ -325,6 +337,77 @@ async def calibrate(
             probe.trace.record("calibration_state_uncertain", message=message)
 
 
+async def reset_factory_calibration(probe: Probe, backup_path: Path) -> None:
+    if not probe.allow_calibration_reset:
+        raise ProbeError("Factory calibration reset is not explicitly authorized.")
+    telemetry = await probe.request("/telemetry")
+    validate_telemetry(telemetry)
+    if str(telemetry.get("status", "")).lower() != "connected":
+        raise ProbeError("Factory calibration reset requires status=connected; finish recovery first.")
+    firmware = await probe.request("/firmware")
+    before = await probe.request("/config")
+    expected: dict[str, float] = {}
+    for field, factory_field in FACTORY_PH_FIELDS.items():
+        value = before.get(factory_field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ProbeError(f"Missing/invalid {factory_field}; refusing an unverifiable reset.")
+        expected[field] = value
+    histories = {}
+    for point in ("mid", "high"):
+        try:
+            histories[point] = await probe.request("/calibration-log", {"point": point})
+        except ProbeRejected as error:
+            histories[point] = error.response
+            print(f"WARNING: {point} calibration history unavailable: {error}", file=sys.stderr)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    with backup_path.open("x", encoding="utf-8") as backup:
+        json.dump({"ts": utc_now(), "address": probe.client.address, "firmware": firmware,
+                   "telemetry": telemetry, "config": before, "calibration_history": histories},
+                  backup, indent=2, allow_nan=False)
+        backup.flush()
+        os.fsync(backup.fileno())
+    probe.trace.record("calibration_reset_backup", path=str(backup_path.resolve()), expected=expected)
+    print(f"Pre-reset backup saved: {backup_path.resolve()}", flush=True)
+    attempted = False
+    verified = False
+    try:
+        # Recheck the mode immediately before the single destructive operation.
+        telemetry = await probe.request("/telemetry")
+        validate_telemetry(telemetry)
+        if str(telemetry.get("status", "")).lower() != "connected":
+            raise ProbeError("Probe entered calibration during preflight; reset refused.")
+        attempted = True
+        result = await probe.request(CALIBRATION_RESET_PATH, method=POST)
+        if result.get("success") is not True:
+            raise ProbeError("Factory calibration reset lacks explicit success=true.", result)
+        after = await probe.request("/config")
+        for field, value in expected.items():
+            actual = after.get(field)
+            if (
+                isinstance(actual, bool) or not isinstance(actual, (int, float))
+                or not math.isfinite(actual) or not math.isclose(actual, value, rel_tol=1e-6, abs_tol=1e-6)
+            ):
+                raise ProbeError(f"Reset verification failed for {field}: expected {value}, received {actual!r}.")
+        telemetry = await probe.request("/telemetry")
+        validate_telemetry(telemetry)
+        if str(telemetry.get("status", "")).lower() != "connected":
+            raise ProbeError("Factory coefficients verified but probe is not reporting normal measurement mode.")
+        probe.trace.record("calibration_reset_verified", response=result, before=before,
+                           after=after, telemetry=telemetry)
+        verified = True
+        print(json.dumps({"calibration_reset_verified": True, "response": result,
+                          "before": before, "after": after, "telemetry": telemetry},
+                         allow_nan=False), flush=True)
+    finally:
+        if attempted and not verified:
+            message = (
+                "Calibration reset was attempted but full read-back verification did not complete. "
+                "Do not repeat it automatically; reconnect read-only and inspect /config first."
+            )
+            print("WARNING: " + message, file=sys.stderr, flush=True)
+            probe.trace.record("calibration_reset_unverified", message=message)
+
+
 def advertisement_record(device: BLEDevice, adv: AdvertisementData) -> dict[str, object]:
     return {
         "address": device.address,
@@ -389,11 +472,18 @@ async def run(args: argparse.Namespace, trace: Trace) -> None:
         device, disconnected_callback=lambda connected: probe.on_disconnect(connected),
         timeout=args.connect_timeout, pair=args.pair,
     )
-    probe = Probe(client, trace, args.timeout, args.confirm_calibration)
+    probe = Probe(client, trace, args.timeout, args.confirm_calibration,
+                  allow_calibration_reset=args.confirm_factory_calibration_reset)
     async with client:
         async with asyncio.timeout(args.timeout):
             await probe.start()
         if args.command == "inspect":
+            return
+        if args.command == "reset-calibration":
+            backup_path = args.backup or Path("probe_logs") / (
+                datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ") + "_calibration_backup.json"
+            )
+            await reset_factory_calibration(probe, backup_path)
             return
         if args.command == "exit-calibration":
             result = await probe.request("/calibration-exit", method=POST)
@@ -453,11 +543,11 @@ def positive_int(value: str) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("scan", "inspect", "read", "calibrate", "exit-calibration"):
+    for name in ("scan", "inspect", "read", "calibrate", "exit-calibration", "reset-calibration"):
         sub = commands.add_parser(name)
         sub.add_argument("--scan-timeout", type=positive_float, default=15)
         sub.add_argument("--log", type=Path, help="new JSONL file; existing files are not overwritten")
-        sub.set_defaults(confirm_calibration=False)
+        sub.set_defaults(confirm_calibration=False, confirm_factory_calibration_reset=False)
         if name == "scan":
             sub.add_argument("--all", action="store_true", help="include other nearby BLE devices")
             continue
@@ -474,6 +564,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             sub.add_argument("--diagnostics", action="store_true", help="also read config/calibration status")
         if name in ("calibrate", "exit-calibration"):
             sub.add_argument("--confirm-calibration", action="store_true", required=True)
+        if name == "reset-calibration":
+            sub.add_argument("--confirm-factory-calibration-reset", action="store_true", required=True)
+            sub.add_argument("--backup", type=Path, help="new pre-reset backup JSON; never overwrites")
         if name == "calibrate":
             sub.add_argument("--mid-ph", type=float, choices=(6.865, 7.0, 7.01), required=True)
             sub.add_argument("--high-ph", type=float, choices=(9.18, 10.0, 10.01, 10.012), required=True)
