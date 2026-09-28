@@ -161,7 +161,7 @@ async def close_runtime(runtime):
     except runtime.errors as exc:
         runtime.report("error", "Transport cleanup failed: %s" % describe_error(exc))
 
-async def calibration_loop(settings, runtime, stop, calibration):
+async def calibration_loop(settings, runtime, stop, calibration, on_success=None):
     """Service MQTT each second while retaining the configured measurement period."""
     poll_started = None
     await calibration.connected(runtime)
@@ -190,6 +190,8 @@ async def calibration_loop(settings, runtime, stop, calibration):
                 await calibration.observe(runtime, telemetry)
             if not calibration.inhibits_measurements:
                 await publish_sample(settings, runtime, telemetry)
+        if on_success is not None:
+            on_success()
         delay = 1.0
         if not calibration.inhibits_measurements and poll_started is not None:
             delay = min(delay, max(0, settings.poll_interval - runtime.elapsed(poll_started)))
@@ -209,6 +211,11 @@ async def run_bridge(settings, runtime, stop, once=False):
     calibration = Calibration(settings, marker) if settings.calibration_enabled else None
     if once and calibration is not None:
         raise ValueError("MQTT calibration requires continuous command processing, not --once.")
+
+    def reset_retry():
+        nonlocal retry
+        retry = settings.retry_min
+
     finished = False
     try:
         while not stop.is_set():
@@ -225,7 +232,7 @@ async def run_bridge(settings, runtime, stop, once=False):
                 runtime.report("info", "Poll interval: %.1fs" % settings.poll_interval)
                 if calibration is not None:
                     stage = "calibration/monitoring service"
-                    await calibration_loop(settings, runtime, stop, calibration)
+                    await calibration_loop(settings, runtime, stop, calibration, on_success=reset_retry)
                     continue
                 while not stop.is_set():
                     started = runtime.ticks()

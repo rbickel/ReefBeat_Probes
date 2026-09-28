@@ -250,6 +250,18 @@ class Runtime:
             raise OSError("MQTT PINGREQ/PINGRESP failed: " + describe_error(exc))
         self._last_ping = self.ticks()
 
+    def _check_mqtt(self, timeout=None):
+        if not self.mqtt_connected():
+            raise OSError("MQTT or WiFi disconnected")
+        started = self.ticks()
+        self.publisher.pump()
+        if timeout is not None:
+            timeout -= self.elapsed(started)
+            if timeout <= 0:
+                raise asyncio.TimeoutError()
+        if self.elapsed(self._last_ping) >= PING_INTERVAL_SECONDS:
+            self._ping(timeout=timeout)
+
     def _configure_wifi_power(self):
         if self._wifi_pm_configured:
             return
@@ -359,7 +371,7 @@ class Runtime:
             self.publisher.connect()
             self._last_ping = self.ticks()
         else:
-            self._ping()
+            self._check_mqtt()
 
     async def _connect_probe(self):
         cfg = self.settings
@@ -427,7 +439,11 @@ class Runtime:
                 raise asyncio.TimeoutError()
             if self.publisher is not None:
                 progress["stage"] = "checking MQTT before BLE write"
-                self._ping(timeout=remaining)
+                if method == POST:
+                    # Confirm broker responsiveness before a potentially irreversible write.
+                    self._ping(timeout=remaining)
+                else:
+                    self._check_mqtt(timeout=remaining)
             remaining = self.settings.request_timeout - self.elapsed(progress["started"])
             if remaining <= 0:
                 raise asyncio.TimeoutError()
@@ -472,7 +488,7 @@ class Runtime:
         if not self.mqtt_connected():
             raise OSError("MQTT unavailable; not queueing payload")
         self.publisher.publish(topic, payload_string, retain=retain)
-        self._last_ping = self.ticks()
+        self._check_mqtt()
 
     async def commands(self):
         if self.settings.calibration_enabled is not True:
@@ -489,15 +505,9 @@ class Runtime:
             ):
                 raise ProbeError("BLE disconnected while waiting")
             if self.publisher is not None:
-                if not self.mqtt_connected():
-                    raise OSError("MQTT or WiFi disconnected while waiting")
-                self.publisher.pump()
+                self._check_mqtt()
                 if self.settings.calibration_enabled and self.publisher.pending():
                     return
-                if self.elapsed(self._last_ping) >= PING_INTERVAL_SECONDS:
-                    self._ping()
-                    if self.settings.calibration_enabled and self.publisher.pending():
-                        return
             await asyncio.sleep(min(0.25, max(0, seconds - self.elapsed(start))))
 
     async def close(self):

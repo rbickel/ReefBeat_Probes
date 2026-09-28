@@ -7,7 +7,7 @@ MQTT_CLIENT_ID = "reef-probe-pico-w-unique-name"  # Change; never reuse the Pi3 
 
 # Optional canonical Settings overrides; defaults live only in reef_mqtt.py.
 OVERRIDES = {
-    "mqtt_timeout": 3.0,
+    "mqtt_timeout": 10.0,
     "calibration_enabled": False,  # Explicit opt-in required; never enable just to test transport.
     # "calibration_command_topic": "reef/sump_ph/calibration/command",  # Exact topic, no wildcards.
     # "calibration_state_topic": "reef/sump_ph/calibration/state",

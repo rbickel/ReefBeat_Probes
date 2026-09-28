@@ -292,7 +292,6 @@ class Publisher:
         try:
             self.client.sock.settimeout(self.socket_timeout)
             self.client.publish(topic, payload, retain=retain, qos=self.qos)
-            self.ping()
         except BaseException:
             self.connected = False
             raise

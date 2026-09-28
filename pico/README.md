@@ -52,7 +52,10 @@ Optional `OVERRIDES` uses **canonical lower-case Settings field names**, such as
 `temperature_topic`, `availability_topic`, `temperature_sensor`, `wifi_timeout`,
 `wifi_disable_power_save`, `wifi_country`, and `status_led`.
 Defaults live in the root module, not a duplicate Pico configuration class.
-The example selects a three-second `mqtt_timeout`.
+The example uses the shared ten-second `mqtt_timeout`. An older board config
+may still override it with three seconds; changing the example on the computer
+does not update the board. Ten seconds allows more network latency, but cannot
+fix an unreliable WiFi link or unreachable broker.
 
 ### Calibration is disabled unless explicitly enabled
 
@@ -274,13 +277,25 @@ argument. Preserve the board's credentials and any `calibration.pending` marker.
   commands and partial input. The upstream bounded CONNECT remains in use;
   a short or rejected CONNACK fails safely rather than resuming a partial session.
 - MQTT socket operations use `mqtt_timeout`. `host` must be numeric IPv4 to avoid
-  DNS blocking during connect. PINGREQ/PINGRESP round trips are serviced every
-  15 seconds during idle waits, before reads, and after sends. Keepalive is
-  derived from the configured timeout budget and is at least 60 seconds.
+  DNS blocking during connect. Routine PINGREQ/PINGRESP round trips are limited
+  to one per 15 seconds, checked during prepare, reads, sends and idle waits.
+  A successful connection and each calibration POST still explicitly verify
+  broker responsiveness. Routine reads and diagnostic publications no longer
+  each demand a separate round trip. Publications do not postpone the next
+  heartbeat, so a busy diagnostic stream still checks the broker regularly.
+  Nonblocking inbound pumping continues between heartbeats, preserving command
+  reception and detection of socket closure. QoS 0 publication means a local
+  send, not an individual broker acknowledgement.
+  Keepalive is derived from the timeout budget and is at least 60 seconds.
   Subscribe/ping waits and incomplete packets have total deadlines, not renewed
   timeouts per fragment. Each nonblocking pump has a bounded work allowance.
   `sleep()` pumps inbound data and checks stop at most every 250 ms between
   bounded socket operations, waking early when commands are queued.
+  A failed heartbeat still closes the transport and requires explicit recovery
+  during calibration; uncertain point-start commands are never replayed.
+  A successful calibration/monitoring service cycle resets reconnect backoff to
+  `retry_min`, just as a normal-mode successful sample does. Repeated failed
+  connection attempts still back off up to `retry_max` without an attempt limit.
 - The MQTT driver registers the `offline` will but does not publish states in
   `prepare()` or `close()`. Availability policy belongs solely to `run_bridge()`.
   Closing TCP leaves the will armed if an explicit offline publication could
@@ -312,7 +327,7 @@ do not replace WiFi/MQTT credentials:
 
 ```python
 OVERRIDES = {
-    "mqtt_timeout": 3.0,
+    "mqtt_timeout": 10.0,
     "wifi_timeout": 60.0,  # Per attempt; recovery cycles continue forever.
     "wifi_disable_power_save": True,
     "status_led": True,

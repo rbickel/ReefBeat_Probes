@@ -46,6 +46,7 @@ At the top of the shared publisher, `POLL_INTERVAL_SECONDS = 60.0` controls the 
 The probe stays connected between requests; normal sampling is approximately
 start-to-start every minute. `--interval 30` temporarily overrides it.
 Failures use bounded exponential reconnect backoff (5 to 60 seconds).
+Successful samples or calibration/monitoring service cycles reset this delay.
 The MQTT background network loop services keepalives even during long intervals.
 
 Defaults match the supplied existing Home Assistant state topics:

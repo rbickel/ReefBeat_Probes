@@ -409,6 +409,25 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.runtime.commands(), [(b"operator-command", False)])
         self.assertEqual(client.pings, initial)
 
+    async def test_closed_mqtt_socket_is_detected_before_heartbeat_is_due(self):
+        await self.runtime.prepare()
+        await self.runtime.connect_probe()
+        client = self.hardware.clients[0]
+        with patch.object(client.sock, "read", return_value=b""):
+            with self.assertRaisesRegex(OSError, "MQTT socket closed"):
+                await self.runtime.read()
+        self.assertEqual(self.runtime.writer.writes, [])
+        self.assertFalse(self.runtime.mqtt_connected())
+
+    async def test_command_pumping_cannot_exhaust_budget_and_still_send_ble(self):
+        await self.runtime.prepare()
+        await self.runtime.connect_probe()
+        self.settings.request_timeout = 1
+        with patch.object(self.runtime.publisher, "pump", side_effect=lambda: self.clock.advance(2)):
+            with self.assertRaisesRegex(ProbeError, "checking MQTT before BLE write"):
+                await self.runtime.read()
+        self.assertEqual(self.runtime.writer.writes, [])
+
     async def test_transport_cleanup_preserves_healthy_wifi_and_synchronized_clock(self):
         await self.runtime.prepare()
         await self.runtime.connect_probe()
