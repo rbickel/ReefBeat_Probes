@@ -1221,6 +1221,72 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hardware.led_changes[-1], 0)
         marker.set.assert_not_called()
 
+    async def test_actual_pico_entry_disconnect_can_reconcile_without_post_replay(self):
+        from reef_calibration import Calibration
+        self.settings.calibration_enabled = True
+        marker = SimpleNamespace(exists=Mock(return_value=False), set=Mock(), clear=Mock())
+        controller = Calibration(self.settings, marker)
+        await self.runtime.prepare()
+        await self.runtime.connect_probe()
+
+        def command(action, **fields):
+            data = {
+                "action": action, "command_id": action + controller.nonce,
+                "boot_id": controller.boot_id, "nonce": controller.nonce,
+                "expires_at": self.runtime.epoch() + 60,
+            }
+            if action != "start":
+                data.update(session_id=controller.session_id, confirm=True)
+            data.update(fields)
+            return json.dumps(data)
+
+        await controller.handle(self.runtime, command("start"))
+        original_writer = self.runtime.writer
+        write = original_writer.write
+
+        async def disconnect_on_enter(data, response, timeout_ms):
+            if b"/calibration-enter" in data:
+                original_writer.writes.append(data)
+                self.runtime.connection.connected = False
+                raise self.runtime.aioble.DeviceDisconnectedError()
+            await write(data, response, timeout_ms)
+
+        original_writer.write = disconnect_on_enter
+        with self.assertRaises(self.runtime.aioble.DeviceDisconnectedError) as error:
+            await controller.handle(self.runtime, command(
+                "point_ready", point="mid", solution_ph=7, solution_rated_temp=25,
+            ))
+        controller.transport_failed(self.runtime, error.exception)
+        self.assertEqual(controller.state, "reconnecting")
+        await self.runtime.close()
+        await self.runtime.prepare()
+        await self.runtime.connect_probe()
+        new_writer = self.runtime.writer
+
+        async def respond_to_verification(data, response, timeout_ms):
+            new_writer.writes.append(data)
+            self.assertEqual(data[5], GET)
+            if b"/telemetry" in data:
+                result = {**TELEMETRY, "status": "calibration"}
+            elif b"/calibration-status" in data:
+                result = {"calibration_status": "idle"}
+            else:
+                self.fail("Unexpected verification request")
+            for part in fragments(result):
+                self.runtime.notify.emit(part)
+            await asyncio.sleep(0)
+
+        new_writer.write = respond_to_verification
+        await controller.connected(self.runtime)
+        self.assertEqual(controller.state, "awaiting_mid")
+        self.assertTrue(controller.enter_confirmed)
+        self.assertEqual(len(new_writer.writes), 2)
+        self.assertEqual(sum(packet[5] == POST for packet in original_writer.writes), 1)
+        marker.clear.assert_not_called()
+        self.assertTrue(all(topic.decode() not in (self.settings.ph_topic, self.settings.temperature_topic)
+                            for client in self.hardware.clients
+                            for topic, _, _, _ in client.publications))
+
     async def test_failed_publish_marks_disconnected_without_replay(self):
         await self.runtime.prepare()
         self.hardware.clients[0].fail_topic = b"test/state"

@@ -37,6 +37,7 @@ class MemoryMarker:
 
 class Runtime:
     errors = (OSError, ValueError, ProbeError, TimeoutError)
+    reconnect_errors = (OSError, TimeoutError)
 
     def __init__(self):
         self.now = 0
@@ -366,10 +367,14 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.controller.transport_failed(self.runtime, OSError("reconnect failed"))
         self.assertIs(self.controller.last_failure, first_failure)
         self.runtime.publish = publish
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [response]
         before = list(self.runtime.calls)
         await self.controller.connected(self.runtime)
         self.assertFalse(self.controller.failure_pending)
-        self.assertEqual(self.runtime.calls, before)
+        self.assertEqual(self.runtime.calls, before + [("/telemetry", None, 1),
+                                                       ("/calibration-status", None, 1)])
+        self.assertEqual(self.controller.state, "calibrating_mid")
         self.assertEqual(self.events("failed")[-1]["data"], first_failure)
 
     async def test_large_firmware_snapshot_is_chunked_instead_of_aborting_session(self):
@@ -504,6 +509,398 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.handle(self.runtime, json.dumps(data))
         self.assertEqual(self.writes(), before)
         self.assertEqual(self.events("duplicate")[-1]["original_result"], "failed_or_uncertain")
+
+    async def test_disconnect_during_enter_verifies_and_waits_for_fresh_mid_confirmation(self):
+        await self.send("start")
+        self.runtime.fail = "/calibration-enter"
+        command = self.command("point_ready", point="mid", solution_ph=7, solution_rated_temp=25)
+        with self.assertRaises(TimeoutError):
+            await self.controller.handle(self.runtime, json.dumps(command))
+        self.assertEqual(self.controller.state, "reconnecting")
+        self.assertTrue(self.marker.pending)
+        original_failure = self.controller.last_failure
+        before = list(self.writes())
+        self.runtime.fail = None
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "idle"}]
+        self.runtime.now += 5
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_mid")
+        self.assertEqual(self.writes(), before)
+        self.assertIs(self.controller.last_failure, original_failure)
+        await self.controller.handle(self.runtime, json.dumps(command))
+        self.assertEqual(self.writes(), before)
+        await self.start_point("mid")
+        self.assertEqual(self.controller.state, "calibrating_mid")
+        self.assertEqual([call[0] for call in self.writes()],
+                         ["/calibration-enter", "/calibration-point-start"])
+
+    async def test_unaccepted_enter_returns_to_waiting_without_replaying_write(self):
+        await self.send("start")
+        self.runtime.fail = "/calibration-enter"
+        with self.assertRaises(TimeoutError):
+            await self.start_point("mid")
+        self.runtime.fail = None
+        before = list(self.writes())
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_mid")
+        self.assertFalse(self.controller.enter_confirmed)
+        self.assertEqual(self.writes(), before)
+        await self.start_point("mid")
+        self.assertEqual([call[0] for call in self.writes()].count("/calibration-enter"), 2)
+
+    async def test_poll_disconnect_resumes_acknowledged_point_with_original_deadline(self):
+        await self.send("start")
+        await self.start_point("mid")
+        started = self.controller.point_started
+        self.runtime.now += 80
+        self.controller.transport_failed(self.runtime, OSError("radio lost"))
+        self.assertEqual(self.controller.state, "reconnecting")
+        before = list(self.writes())
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "in_progress", "time_left": 90}]
+        self.runtime.now += 10
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "calibrating_mid")
+        self.assertEqual(self.controller.point_started, started)
+        self.assertTrue(self.controller.seen_progress)
+        self.assertEqual(self.writes(), before)
+        self.runtime.now = started + self.cfg.calibration_timeout
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.writes(), before)
+
+    async def test_success_while_disconnected_requires_observed_progress(self):
+        for seen in (False, True):
+            with self.subTest(seen_progress=seen):
+                self.controller = Calibration(self.cfg, MemoryMarker(), self.new_token)
+                await self.send("start")
+                await self.start_point("mid")
+                self.controller.seen_progress = seen
+                self.controller.transport_failed(self.runtime, OSError("disconnected"))
+                self.runtime.telemetry["status"] = "calibration"
+                self.runtime.statuses = [{"calibration_status": "success"}]
+                before = list(self.writes())
+                await self.controller.connected(self.runtime)
+                self.assertEqual(self.writes(), before)
+                if seen:
+                    self.assertEqual(self.controller.state, "calibrating_mid")
+                    self.runtime.statuses = [{"calibration_status": "success"}]
+                    await self.controller.tick(self.runtime)
+                    self.assertEqual(self.controller.state, "awaiting_high")
+                    self.assertEqual(self.controller.completed_points, ["mid"])
+                else:
+                    self.assertEqual(self.controller.state, "recovery_required")
+                self.runtime.telemetry["status"] = "connected"
+
+    async def test_failed_or_mismatched_reconnect_status_requires_recovery_without_writes(self):
+        for telemetry, status in (
+            ("connected", None),
+            ("calibration", {"calibration_status": "idle"}),
+            ("calibration", {"calibration_status": "fail_check_solution"}),
+            ("calibration", {"calibration_status": "unknown"}),
+            ("calibration", {"calibration_status": "in_progress", "point": "high"}),
+        ):
+            with self.subTest(telemetry=telemetry, status=status):
+                self.controller = Calibration(self.cfg, MemoryMarker(), self.new_token)
+                self.runtime.telemetry["status"] = "connected"
+                await self.send("start")
+                await self.start_point("mid")
+                self.controller.transport_failed(self.runtime, OSError("disconnected"))
+                self.runtime.telemetry["status"] = telemetry
+                self.runtime.statuses = [status] if status else []
+                before = list(self.writes())
+                await self.controller.connected(self.runtime)
+                self.assertEqual(self.controller.state, "recovery_required")
+                self.assertEqual(self.writes(), before)
+
+    async def test_reconnect_window_does_not_restart_with_each_failure(self):
+        await self.send("start")
+        self.controller.transport_failed(self.runtime, OSError("first interruption"))
+        self.runtime.now += 20
+        self.controller.transport_failed(self.runtime, OSError("still disconnected"))
+        self.assertEqual(self.controller.state, "reconnecting")
+        self.runtime.now = self.cfg.calibration_reconnect_timeout
+        before = list(self.runtime.calls)
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.runtime.calls, before)
+        self.assertIn("reconnect", self.controller.detail.lower())
+
+    async def test_waiting_high_reconnect_preserves_point_and_wait_deadline(self):
+        await self.send("start")
+        await self.start_point("mid")
+        await self.complete_point()
+        original_wait = self.controller.wait_started
+        self.controller.transport_failed(self.runtime, OSError("lost connection"))
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "success"}]
+        self.runtime.now += 10
+        before = list(self.writes())
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_high")
+        self.assertEqual(self.controller.completed_points, ["mid"])
+        self.assertEqual(self.controller.wait_started, original_wait)
+        self.assertEqual(self.writes(), before)
+
+    async def test_reconnect_during_settling_keeps_original_settle_start(self):
+        await self.send("start")
+        await self.send("cancel")
+        await self.send("returned")
+        start = self.controller.wait_started
+        self.controller.transport_failed(self.runtime, OSError("lost broker"))
+        self.runtime.now += 10
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "settling")
+        self.assertEqual(self.controller.wait_started, start)
+        self.assertTrue(self.marker.pending)
+        self.runtime.now += 20
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "idle")
+        self.assertFalse(self.marker.pending)
+
+    async def test_point_acknowledged_before_mqtt_error_is_not_replayed(self):
+        await self.send("start")
+        publish = self.runtime.publish
+
+        async def fail_on_point_diagnostic(topic, payload, retain=True):
+            if topic.endswith("/calibration-point-start/mid"):
+                raise OSError("MQTT disconnected after BLE success")
+            await publish(topic, payload, retain)
+
+        self.runtime.publish = fail_on_point_diagnostic
+        with self.assertRaises(OSError):
+            await self.start_point("mid")
+        self.assertEqual(self.controller.state, "reconnecting")
+        self.runtime.publish = publish
+        before = list(self.writes())
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "in_progress"}]
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "calibrating_mid")
+        self.assertEqual(self.writes(), before)
+
+    async def test_reboot_during_reconnect_requires_manual_recovery(self):
+        await self.send("start")
+        self.controller.transport_failed(self.runtime, OSError("disconnected"))
+        self.assertEqual(self.controller.state, "reconnecting")
+        replacement = Calibration(self.cfg, self.marker)
+        self.assertEqual(replacement.state, "recovery_required")
+        before = list(self.runtime.calls)
+        await replacement.connected(self.runtime)
+        self.assertEqual(self.runtime.calls, before)
+
+    async def test_entry_reconnect_with_unexpected_active_point_does_not_resume(self):
+        await self.send("start")
+        self.runtime.fail = "/calibration-enter"
+        with self.assertRaises(TimeoutError):
+            await self.start_point("mid")
+        self.runtime.fail = None
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "in_progress"}]
+        before = list(self.writes())
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.writes(), before)
+
+    async def test_unknown_external_calibration_does_not_restore_waiting_mid(self):
+        await self.send("start")
+        self.controller.transport_failed(self.runtime, OSError("offline"))
+        self.runtime.telemetry["status"] = "calibration"
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.writes(), [])
+
+    async def test_high_confirmation_read_failure_restores_waiting_without_repeating_mid(self):
+        await self.send("start")
+        await self.start_point("mid")
+        await self.complete_point()
+        self.runtime.fail = "/telemetry"
+        with self.assertRaises(TimeoutError):
+            await self.start_point("high")
+        self.assertEqual(self.controller.state, "reconnecting")
+        self.runtime.fail = None
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "success", "point": "mid"}]
+        before = list(self.writes())
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_high")
+        self.assertEqual(self.writes(), before)
+        await self.start_point("high")
+        self.assertEqual(self.controller.state, "calibrating_high")
+        self.assertEqual([call[0] for call in self.writes()].count("/calibration-enter"), 1)
+
+    async def test_diagnostics_failure_after_mid_success_does_not_duplicate_completed_point(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.statuses = [{"calibration_status": "in_progress"}]
+        await self.controller.tick(self.runtime)
+        self.runtime.now += 3
+        self.runtime.statuses = [{"calibration_status": "success"}]
+        self.runtime.fail = "/telemetry"
+        with self.assertRaises(TimeoutError) as error:
+            await self.controller.tick(self.runtime)
+        self.controller.transport_failed(self.runtime, error.exception)
+        self.assertEqual(self.controller.state, "reconnecting")
+        self.assertEqual(self.controller.completed_points, ["mid"])
+        self.runtime.fail = None
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "success"}] * 2
+        await self.controller.connected(self.runtime)
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_high")
+        self.assertEqual(self.controller.completed_points, ["mid"])
+
+    async def test_verified_high_success_is_followed_by_only_one_exit(self):
+        await self.send("start")
+        await self.start_point("mid")
+        await self.complete_point()
+        await self.start_point("high")
+        self.runtime.statuses = [{"calibration_status": "in_progress"}]
+        await self.controller.tick(self.runtime)
+        self.controller.transport_failed(self.runtime, OSError("temporary disconnect"))
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "success", "point": "high"}] * 2
+        before = list(self.writes())
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.writes(), before)
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertEqual(self.controller.completed_points, ["mid", "high"])
+        self.assertEqual([call[0] for call in self.writes()].count("/calibration-exit"), 1)
+
+    async def test_exit_ack_before_publication_failure_is_not_replayed(self):
+        await self.send("start")
+        await self.start_point("mid")
+        publish = self.runtime.publish
+
+        async def fail_exit_publication(topic, payload, retain=True):
+            if topic.endswith("/calibration-exit"):
+                raise OSError("publish failed")
+            await publish(topic, payload, retain)
+
+        self.runtime.publish = fail_exit_publication
+        with self.assertRaises(OSError):
+            await self.send("cancel")
+        self.assertEqual(self.controller.state, "reconnecting")
+        self.runtime.publish = publish
+        self.runtime.telemetry["status"] = "connected"
+        before = list(self.writes())
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertEqual(self.controller.outcome, "cancelled_partial_calibration_possible")
+        self.assertEqual(self.writes(), before)
+        self.assertTrue(self.marker.pending)
+
+    async def test_reconnect_deadline_checked_after_verification_io(self):
+        await self.send("start")
+        self.controller.transport_failed(self.runtime, OSError("offline"))
+        original = self.runtime.request
+
+        async def slow_request(path, payload=None, method=1):
+            self.runtime.now += self.cfg.calibration_reconnect_timeout
+            return await original(path, payload, method)
+
+        self.runtime.request = slow_request
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertIn("window expired", self.controller.detail)
+        self.assertEqual(self.writes(), [])
+
+    async def test_wait_deadline_checked_before_read_only_reconciliation(self):
+        await self.send("start")
+        self.runtime.now = self.cfg.calibration_wait_timeout - 2
+        self.controller.transport_failed(self.runtime, OSError("offline"))
+        self.runtime.now += 3
+        before = list(self.runtime.calls)
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertIn("buffer wait deadline", self.controller.detail)
+        self.assertEqual(self.runtime.calls, before)
+
+    async def test_commands_during_reconnect_cannot_start_or_cancel_unverified_operations(self):
+        await self.send("start")
+        self.controller.transport_failed(self.runtime, OSError("offline"))
+        before = list(self.runtime.calls)
+        for action in ("start", "point_ready", "cancel", "recover", "returned"):
+            await self.send(action)
+        self.assertEqual(self.controller.state, "reconnecting")
+        self.assertEqual(self.runtime.calls, before)
+        self.assertEqual(len(self.events("rejected")), 5)
+
+    async def test_cancel_after_verified_entry_sends_exit_only_on_explicit_cancel(self):
+        await self.send("start")
+        self.runtime.fail = "/calibration-enter"
+        with self.assertRaises(TimeoutError):
+            await self.start_point("mid")
+        self.runtime.fail = None
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "idle"}]
+        await self.controller.connected(self.runtime)
+        self.assertEqual([call[0] for call in self.writes()], ["/calibration-enter"])
+        await self.send("cancel")
+        self.assertEqual(self.controller.state, "awaiting_return")
+        self.assertEqual([call[0] for call in self.writes()],
+                         ["/calibration-enter", "/calibration-exit"])
+
+    async def test_protocol_corruption_is_not_automatically_resumed(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.controller.transport_failed(self.runtime, ProbeError("Missing response fragment"))
+        self.assertEqual(self.controller.state, "recovery_required")
+        before = list(self.runtime.calls)
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.runtime.calls, before)
+
+    async def test_reconnect_keeps_aquarium_state_unavailable_and_tokens_fresh(self):
+        await self.send("start")
+        old_nonce = self.controller.nonce
+        self.controller.transport_failed(self.runtime, OSError("disconnected"))
+        self.assertNotEqual(self.controller.nonce, old_nonce)
+        old_nonce = self.controller.nonce
+        await self.controller.connected(self.runtime)
+        self.assertNotEqual(self.controller.nonce, old_nonce)
+        self.assertEqual(self.controller.state, "awaiting_mid")
+        self.assertFalse(any(topic in (self.cfg.ph_topic, self.cfg.temperature_topic)
+                             for topic, _, _ in self.runtime.published))
+        self.assertFalse(any(topic == self.cfg.availability_topic and payload == "online"
+                             for topic, payload, _ in self.runtime.published))
+        self.assertTrue(self.marker.pending)
+
+    async def test_mismatched_progress_cannot_authorize_success_after_mqtt_failure(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.controller.transport_failed(self.runtime, OSError("offline"))
+        self.runtime.telemetry["status"] = "calibration"
+        self.runtime.statuses = [{"calibration_status": "in_progress", "point": "high"}]
+        publish = self.runtime.publish
+
+        async def fail_status_publish(topic, payload, retain=True):
+            if topic.endswith("/calibration-status/mid"):
+                raise OSError("MQTT disconnected")
+            await publish(topic, payload, retain)
+
+        self.runtime.publish = fail_status_publish
+        with self.assertRaises(OSError):
+            await self.controller.connected(self.runtime)
+        self.assertFalse(self.controller.seen_progress)
+        self.runtime.publish = publish
+        self.runtime.statuses = [{"calibration_status": "success"}]
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.controller.completed_points, [])
+
+    async def test_expired_reconnect_does_not_poison_later_return_checkpoint(self):
+        await self.send("start")
+        self.controller.transport_failed(self.runtime, OSError("offline"))
+        self.runtime.now += self.cfg.calibration_reconnect_timeout
+        self.controller.transport_failed(self.runtime, OSError("still offline"))
+        self.assertEqual(self.controller.state, "recovery_required")
+        await self.send("recover")
+        self.controller.transport_failed(self.runtime, OSError("new interruption"))
+        self.assertEqual(self.controller.state, "reconnecting")
+        await self.controller.connected(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_return")
 
     async def test_reboot_with_pending_marker_cannot_auto_resume_or_publish(self):
         old_boot = self.controller.boot_id
@@ -660,6 +1057,70 @@ class MarkerTests(unittest.TestCase):
                 self.assertIn("session_id", command)
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_outer_loop_reconnects_and_verifies_entry_without_replaying_a_write(self):
+        cfg = reef_mqtt.Settings(calibration_enabled=True)
+        marker = MemoryMarker()
+        controller = Calibration(cfg, marker)
+        runtime = Runtime()
+        runtime.prepare = AsyncMock()
+        runtime.connect_probe = AsyncMock()
+        runtime.close = AsyncMock()
+        runtime.mqtt_connected = lambda: True
+        runtime.read = AsyncMock(return_value=TELEMETRY)
+        stop = asyncio.Event()
+        sent = set()
+        request = runtime.request
+
+        async def lose_enter_response(path, payload=None, method=1):
+            if path == "/calibration-enter":
+                runtime.calls.append((path, payload, method))
+                runtime.telemetry["status"] = "calibration"
+                runtime.statuses = [{"calibration_status": "idle"}]
+                raise OSError("BLE disconnected after entry")
+            return await request(path, payload, method)
+
+        async def commands():
+            state = controller.state
+            if state in sent:
+                if state == "awaiting_mid":
+                    stop.set()
+                return []
+            data = {
+                "boot_id": controller.boot_id, "nonce": controller.nonce,
+                "command_id": "test-" + state, "expires_at": runtime.epoch() + 60,
+            }
+            if state == "idle":
+                data["action"] = "start"
+            elif state == "awaiting_mid":
+                data.update(action="point_ready", point="mid", solution_ph=7,
+                            solution_rated_temp=25, confirm=True, session_id=controller.session_id)
+            else:
+                return []
+            sent.add(state)
+            return [(json.dumps(data).encode(), False)]
+
+        async def sleep(seconds, event, monitor_probe=False):
+            runtime.now += seconds
+            if runtime.now > 30:
+                raise AssertionError("Reconciliation did not finish")
+
+        runtime.request, runtime.commands, runtime.sleep = lose_enter_response, commands, sleep
+        with (
+            patch("reef_calibration.PendingMarker", return_value=marker),
+            patch("reef_calibration.Calibration", return_value=controller),
+        ):
+            await reef_mqtt.run_bridge(cfg, runtime, stop)
+        self.assertEqual(controller.state, "awaiting_mid")
+        self.assertEqual(runtime.connect_probe.await_count, 2)
+        self.assertEqual([path for path, _, method in runtime.calls if method == POST],
+                         ["/calibration-enter"])
+        runtime.read.assert_not_awaited()
+        self.assertTrue(marker.pending)
+        states = [json.loads(payload)["state"] for topic, payload, _ in runtime.published
+                  if topic == cfg.calibration_state_topic]
+        self.assertIn("reconnecting", states)
+        self.assertNotIn("recovery_required", states)
+
     async def test_host_cancellation_keeps_pending_marker_and_marks_offline(self):
         cfg = reef_mqtt.Settings(calibration_enabled=True)
         marker = MemoryMarker(True)

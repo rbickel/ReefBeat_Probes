@@ -26,7 +26,7 @@ from reef_mqtt import (
     PH_TOPIC, TEMPERATURE_TOPIC, TEMPERATURE_SENSOR_LABEL, AVAILABILITY_TOPIC, MQTT_QOS,
 )
 from reef_probe import Probe, ProbeError
-from reef_probe_protocol import GET
+from reef_probe_protocol import GET, ProbeConnectionError
 
 LOG = logging.getLogger("reef_mqtt")
 Messages = list[tuple[str, dict[str, object]]]
@@ -286,6 +286,7 @@ async def wait_or_stop(stop: asyncio.Event, seconds: float) -> None:
 
 class Runtime:
     errors = (ProbeError, BleakError, MqttError, OSError, TimeoutError, ValueError)
+    reconnect_errors = (ProbeConnectionError, BleakError, MqttError, OSError, TimeoutError)
 
     def __init__(self, settings: Settings, publisher: Publisher):
         self.settings = settings
@@ -301,7 +302,7 @@ class Runtime:
             self.settings.address, timeout=self.settings.scan_timeout,
         )
         if device is None:
-            raise ProbeError(
+            raise ProbeConnectionError(
                 f"Probe {self.settings.address} not advertising. Check USB power; "
                 "disconnect other BLE clients so this bridge can connect."
             )

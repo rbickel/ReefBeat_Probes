@@ -76,6 +76,7 @@ the exact topic, never a wildcard. The defaults are:
 | `calibration_poll_interval` | 3 seconds |
 | `calibration_command_ttl` | 120 seconds |
 | `calibration_settle_seconds` | 30 seconds |
+| `calibration_reconnect_timeout` | 60 seconds |
 | `calibration_marker_path` | `calibration.pending` |
 
 Use a persistent, writable board filesystem for the marker; do not remove a
@@ -83,6 +84,14 @@ pending marker to bypass recovery. The shared controller owns command validation
 retained/replay rejection, operator authorization, state transitions and recovery,
 not this adapter. See the root documentation for the staged workflow and payloads.
 MQTT callbacks only enqueue bytes and metadata; they never call BLE.
+An eligible BLE/MQTT interruption now publishes `reconnecting` while the shared
+controller attempts read-only verification on a fresh connection. It preserves
+the original point/wait deadlines and completed points. A lost calibration-entry
+response can return to `awaiting_mid` for a fresh placement confirmation; an
+acknowledged active point can resume status polling. Ambiguous point-start/exit
+writes, unexpected firmware state, expired verification windows and process
+reboots still require explicit recovery. See
+[reconnect rules](../README.md#automatic-reconnect-and-verification).
 **No calibration, broker access, BLE connection, flashing or hardware validation
 was performed for this implementation.** Do not enable calibration to test code.
 
@@ -291,8 +300,9 @@ argument. Preserve the board's credentials and any `calibration.pending` marker.
   timeouts per fragment. Each nonblocking pump has a bounded work allowance.
   `sleep()` pumps inbound data and checks stop at most every 250 ms between
   bounded socket operations, waking early when commands are queued.
-  A failed heartbeat still closes the transport and requires explicit recovery
-  during calibration; uncertain point-start commands are never replayed.
+  A failed heartbeat still closes the transport. During calibration, eligible
+  checkpoints get bounded read-only reconnect verification before manual
+  recovery is required; uncertain point-start commands are never replayed.
   A successful calibration/monitoring service cycle resets reconnect backoff to
   `retry_min`, just as a normal-mode successful sample does. Repeated failed
   connection attempts still back off up to `retry_max` without an attempt limit.

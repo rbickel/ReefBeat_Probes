@@ -8,6 +8,7 @@ from pico_mqtt import Publisher
 from reef_mqtt import describe_error
 from reef_probe_protocol import (
     ACK, GET, POST, REST, SERVICE_UUID, WRITE_UUID, NOTIFY_UUID, ProbeError, ProbeRejected,
+    ProbeConnectionError,
     Response, decode_response, request_packets, unpack_packet, validate_telemetry,
 )
 
@@ -132,6 +133,10 @@ class Runtime:
         self.errors = (
             OSError, ValueError, asyncio.TimeoutError, ProbeError,
             aioble.GattError, aioble.DeviceDisconnectedError, MQTTException,
+        )
+        self.reconnect_errors = (
+            OSError, asyncio.TimeoutError, ProbeConnectionError,
+            aioble.DeviceDisconnectedError, MQTTException,
         )
         self.wlan = network.WLAN()
         self.led = None
@@ -414,7 +419,7 @@ class Runtime:
         try:
             await asyncio.wait_for(self._connect_probe(), self.settings.scan_timeout)
         except asyncio.TimeoutError:
-            raise ProbeError("Timeout during %s (BLE setup budget %ss)"
+            raise ProbeConnectionError("Timeout during %s (BLE setup budget %ss)"
                              % (self._connect_stage, self.settings.scan_timeout))
 
     async def read(self):
@@ -430,7 +435,7 @@ class Runtime:
         async with self._request_lock:
             if (self.connection is None or not self.connection.is_connected()
                     or not self._subscribed):
-                raise ProbeError("BLE is not connected and subscribed")
+                raise ProbeConnectionError("BLE is not connected and subscribed")
             if self._stream_failed:
                 raise ProbeError("BLE response stream failed; close before reconnect")
             packets = request_packets(method, path, payload, mtu=self._mtu)
@@ -477,7 +482,7 @@ class Runtime:
                 self.settings.request_timeout,
             )
         except asyncio.TimeoutError:
-            raise ProbeError(
+            raise ProbeConnectionError(
                 "%s %s timed out after %ss: %s; notifications=%s, mtu=%s, connected=%s"
                 % ("GET" if method == GET else "POST", path, self.settings.request_timeout,
                    progress["stage"], self.queue.received if self.queue is not None else 0,
@@ -503,7 +508,7 @@ class Runtime:
             if monitor_probe and (
                 self.connection is None or not self.connection.is_connected()
             ):
-                raise ProbeError("BLE disconnected while waiting")
+                raise ProbeConnectionError("BLE disconnected while waiting")
             if self.publisher is not None:
                 self._check_mqtt()
                 if self.settings.calibration_enabled and self.publisher.pending():

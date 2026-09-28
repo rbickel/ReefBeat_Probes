@@ -43,6 +43,7 @@ class Settings:
             "calibration_timeout": 360.0, "calibration_wait_timeout": 900.0,
             "calibration_poll_interval": 3.0, "calibration_command_ttl": 120,
             "calibration_settle_seconds": 30.0,
+            "calibration_reconnect_timeout": 60.0,
             "calibration_marker_path": "calibration.pending",
         }
         for key in overrides:
@@ -58,6 +59,7 @@ class Settings:
             "retry_min", "retry_max", "wifi_timeout", "calibration_timeout",
             "calibration_wait_timeout", "calibration_poll_interval",
             "calibration_command_ttl", "calibration_settle_seconds",
+            "calibration_reconnect_timeout",
         ):
             value = getattr(self, key)
             if (

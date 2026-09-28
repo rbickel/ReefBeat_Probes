@@ -582,6 +582,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         for override in (
             {"calibration_enabled": "yes"}, {"calibration_timeout": 0},
             {"calibration_wait_timeout": float("inf")}, {"calibration_command_ttl": 0},
+            {"calibration_reconnect_timeout": 0}, {"calibration_reconnect_timeout": float("inf")},
             {"calibration_command_topic": app.PH_TOPIC},
             {"calibration_state_topic": "reef/+/state"},
             {"calibration_event_topic": "reef/sump_ph/calibration/state"},

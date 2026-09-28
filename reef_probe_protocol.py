@@ -25,6 +25,10 @@ class ProbeRejected(ProbeError):
         super().__init__("Probe rejected the request: %s" % response.get("message", response), response)
 
 
+class ProbeConnectionError(ProbeError):
+    """Connection loss or response timeout, not a firmware/protocol rejection."""
+
+
 def _finite_numbers(value):
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError("Non-finite JSON number")

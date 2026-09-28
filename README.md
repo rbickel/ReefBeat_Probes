@@ -581,8 +581,9 @@ the request body, point, boot/session/command IDs and request duration. Buffer
 readings are diagnostic only: they never overwrite aquarium pH/temperature topics.
 A complete firmware rejection of buffer telemetry is reported as
 `diagnostic_unavailable`; further optional buffer telemetry is skipped for that
-point. Transport or malformed-response failures still require recovery because
-the BLE stream can no longer be trusted. A last available buffer sample may
+point. Transport failures close the old BLE stream and may use the bounded
+read-only checkpoint verification described below; malformed responses still
+require manual recovery. A last available buffer sample may
 precede completion; inspect its timestamp rather than treating it as an accuracy
 verification.
 
@@ -794,9 +795,10 @@ was attempted, the host sends and confirms exit. State becomes `awaiting_return`
 }
 ```
 
-After a BLE/MQTT failure, ambiguous write timeout, point failure, operator timeout,
-or host reboot with a pending marker, state is `recovery_required`. Writes are
-never automatically replayed. Use:
+An eligible BLE/MQTT interruption first enters `reconnecting`, as described
+below. An ambiguous point-start/exit write, probe/protocol failure, expired
+deadline, unverified reconnect or host reboot with a pending marker enters
+`recovery_required`. Writes are never automatically replayed. Use:
 
 ```json
 {
@@ -825,6 +827,68 @@ refuses to run until calibration is enabled and recovery is completed.
 The file is written only at session start/external-calibration detection and
 removed after confirmed return; status polling does not wear flash with writes.
 
+### Automatic reconnect and verification
+
+Calibration no longer abandons every session after a single transport
+interruption. The controller retains **in-memory checkpoints** and distinguishes
+connection loss/response timeouts from malformed responses and explicit firmware
+rejections. Normal transport reconnection still uses the bounded backoff above.
+
+While `reconnecting`, aquarium measurements remain offline and control commands
+are rejected until the new state/nonce is published. The controller performs only
+GET `/telemetry` and, when the probe reports calibration mode, GET
+`/calibration-status`. It does not resend any interrupted POST or reset coefficients.
+
+| Checkpoint | Verification and next step |
+| --- | --- |
+| Waiting for mid / entry response lost, no point-start sent | Confirm normal mode or entered-but-idle calibration mode; return to `awaiting_mid`. Require a **new** manual buffer-ready command. If already entered, skip a second enter command. |
+| Waiting for high after mid success | Require calibration mode and the preceding successful point state; restore `awaiting_high` without redoing mid. |
+| Point-start explicitly acknowledged | Require calibration mode and `in_progress`, or `success` only if progress was previously observed. Resume polling with the **original** point deadline. |
+| Exit explicitly acknowledged | Require normal measurement mode; restore `awaiting_return`. Never automatically confirm physical return. |
+| Settling after explicit return | Require normal mode; preserve the original settling start and perform the normal health check before resuming aquarium publication. |
+| Point-start or exit outcome unknown | Manual `recovery_required`; no blind replay or inference of a successful write. |
+
+Any returned point identifier must match the expected point. Firmware revisions
+without an identifier cannot authenticate a remote session; reconciliation
+assumes this bridge is the **only BLE/calibration controller**, as required for
+ordinary operation. Do not connect ReefBeat or another controller concurrently.
+An unexpected mode, point, status, or `fail_*` result does not certify success.
+
+`calibration_reconnect_timeout` defaults to **60 seconds per interruption**.
+Repeated connection failures do not restart that window. Verification must
+finish before both that window and the original point/buffer-wait deadline;
+timeouts are checked between bounded operations. A late connection may restore
+transport but cannot resume an expired calibration. A process restart loses
+the checkpoint and always requires manual recovery using the existing marker.
+
+The first interruption remains in the retained failure diagnostics even after
+successful reconnection. The state includes `reconnect` with the intended
+`resume_state`, elapsed seconds and configured window; a successful verification
+emits `reconnected`. A subsequent normal status poll may finish an acknowledged
+point and issue its **first** normal calibration-exit command; verification
+itself never writes to the probe.
+
+Existing Home Assistant scripts do not change. Add `reconnecting` as a waiting
+state on dashboards; do not automatically run Recover on any error event. For
+the simple Entities card, an optional informational row is:
+
+```yaml
+- type: conditional
+  conditions:
+    - entity: sensor.reefpi0_reef_ph_calibration_workflow
+      state: "reconnecting"
+  row:
+    type: section
+    label: Reconnecting and verifying calibration - please wait
+```
+
+Deploy `reef_mqtt.py`, `reef_calibration.py`, `reef_probe_protocol.py`, and
+`pico_runtime.py` together on the Pico, keeping `pico_mqtt.py` from the heartbeat
+update. Linux also needs the updated `reef_probe.py` and `reef_mqtt_linux.py`.
+Keep credentials, calibration markers and stored coefficients. An already
+interrupted session cannot be reconstructed by installing this update; finish
+its explicit recovery/return flow first, then restart the interpreter.
+
 ### Status/events, timing and LED
 
 Example progress event (not retained):
@@ -845,7 +909,7 @@ Example progress event (not retained):
 Command `result: completed` means the action was handled. For `point_ready`, that
 means **the point was started**, not that calibration succeeded. Wait for
 `point_completed`, the expected next state, and finally `two_points_completed`.
-Other event results include `failed`, `rejected`, `duplicate`, `snapshot`,
+Other event results include `reconnected`, `failed`, `rejected`, `duplicate`, `snapshot`,
 `diagnostic_unavailable`, and `monitoring_resumed`.
 
 Commands are serviced about every second while idle/waiting and queued while a
@@ -864,6 +928,7 @@ Shared configurable limits:
 | `calibration_poll_interval` | 3 seconds |
 | `calibration_command_ttl` | 120 seconds maximum |
 | `calibration_settle_seconds` | 30 seconds after return |
+| `calibration_reconnect_timeout` | 60 seconds per transport interruption |
 
 The Pico keeps existing success/error indications and supports calibration/
 waiting LED cues through its runtime; the MQTT state remains authoritative.

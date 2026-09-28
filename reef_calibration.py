@@ -86,6 +86,11 @@ class Calibration:
         self.buffer_telemetry_supported = True
         self.last_failure = None
         self.failure_pending = False
+        self.checkpoint = None
+        self.pending_write = None
+        self.enter_confirmed = False
+        self.reconnect_started = None
+        self.last_action = None
         if self.marker.exists():
             self.session_id = new_token()
             self.state = "recovery_required"
@@ -108,6 +113,11 @@ class Calibration:
             "last_failure": state_summary(self.failure_summary(), self.cfg.calibration_failure_topic),
             "failure_topic": self.cfg.calibration_failure_topic,
             "diagnostics_topic": self.cfg.probe_diagnostics_topic,
+            "reconnect": {
+                "resume_state": self.checkpoint,
+                "elapsed_seconds": runtime.elapsed(self.reconnect_started),
+                "timeout_seconds": self.cfg.calibration_reconnect_timeout,
+            } if self.state == "reconnecting" else None,
         }
         if len(json.dumps(result).encode("utf-8")) > 3072:
             result["progress"] = {"details_topic": self.response_topic("/calibration-status")}
@@ -151,7 +161,7 @@ class Calibration:
 
     def record_failure(self, runtime, message, kind, error=None, stage=None):
         # Preserve the initiating failure through repeated reconnect/recovery errors.
-        if (self.state == "recovery_required" and self.last_failure is not None
+        if (self.state in ("recovery_required", "reconnecting") and self.last_failure is not None
                 and self.last_failure["session_id"] == self.session_id):
             return
         try:
@@ -206,9 +216,15 @@ class Calibration:
                 runtime.report("error", "Could not publish probe error response: " + error_text(diagnostic_error))
             raise
         exchange.update(response=result, elapsed_seconds=runtime.elapsed(started))
+        if method == POST and result.get("success") is True:
+            self._write_confirmed(runtime, path)
         if path == "/calibration-status":
             self.last_status = result
             self.progress = result
+            if (self.state.startswith("calibrating_")
+                    and result.get("calibration_status") == "in_progress"
+                    and result.get("point", self.point) == self.point):
+                self.seen_progress = True
         if path == "/telemetry":
             self.last_telemetry = exchange
         await publish_document(runtime, topic, exchange)
@@ -226,6 +242,7 @@ class Calibration:
 
     async def _set_state(self, runtime, state, detail):
         self.state, self.detail = state, detail
+        self.checkpoint = state if state not in ("idle", "recovery_required") else None
         self.nonce = self.new_token()
         self.wait_started = runtime.ticks()
         self.progress = None
@@ -238,14 +255,124 @@ class Calibration:
             self.record_failure(runtime, error_text(error),
                                 "probe_rejected" if isinstance(error, ProbeRejected) else "transport_or_protocol",
                                 error, stage)
-            self.state = "recovery_required"
-            self.detail = "Operation failed; no command was retried. " + error_text(error)[:512]
+            can_reconnect = (
+                self.state != "recovery_required" and self.checkpoint is not None
+                and isinstance(error, getattr(runtime, "reconnect_errors", ()))
+                and self.pending_write in (None, "/calibration-enter")
+            )
+            if can_reconnect:
+                if self.reconnect_started is None:
+                    self.reconnect_started = runtime.ticks()
+                reason = self._reconnect_expired(runtime)
+                if reason is None:
+                    self.state = "reconnecting"
+                    self.detail = "Connection interrupted; reconnecting to verify without replaying writes. " + error_text(error)[:384]
+                else:
+                    self.state = "recovery_required"
+                    self.detail = reason
+                    self.checkpoint = None
+                    self.reconnect_started = None
+            else:
+                self.state = "recovery_required"
+                self.detail = "Operation failed; no command was retried. " + error_text(error)[:512]
+                self.checkpoint = None
+                self.reconnect_started = None
             self.nonce = self.new_token()
-            self.enter_attempted = True
+
+    def _write_confirmed(self, runtime, path):
+        # Record the BLE acknowledgement before MQTT diagnostics can fail.
+        self.pending_write = None
+        if path == "/calibration-enter":
+            self.enter_confirmed = True
+        elif path == "/calibration-point-start":
+            self.point_started = runtime.ticks()
+            self.last_poll = None
+            self.seen_progress = False
+            self.checkpoint = "calibrating_" + self.point
+        elif path == "/calibration-exit":
+            self.enter_attempted = self.enter_confirmed = False
+            self.checkpoint = "awaiting_return"
+            if self.last_action == "cancel":
+                self.outcome = "cancelled_partial_calibration_possible"
+            elif self.last_action == "recover":
+                self.outcome = "recovered_partial_calibration_possible"
+            elif self.completed_points == ["mid", "high"]:
+                self.outcome = "two_points_completed"
+
+    def _reconnect_expired(self, runtime):
+        if (self.reconnect_started is not None
+                and runtime.elapsed(self.reconnect_started) >= self.cfg.calibration_reconnect_timeout):
+            return "Automatic reconnect window expired; explicit recovery required."
+        if (self.checkpoint or "").startswith("calibrating_"):
+            if self.point_started is None or runtime.elapsed(self.point_started) >= self.cfg.calibration_timeout:
+                return "Original point deadline expired while disconnected; explicit recovery required."
+        if self.checkpoint in ("awaiting_mid", "awaiting_high") and (
+            self.wait_started is None or runtime.elapsed(self.wait_started) >= self.cfg.calibration_wait_timeout
+        ):
+            return "Original buffer wait deadline expired; explicit recovery required."
+        return None
+
+    async def _verify_reconnect(self, runtime):
+        reason = self._reconnect_expired(runtime)
+        if reason is not None:
+            await self._recovery(runtime, reason, kind="reconnect_unverified")
+            return
+        target = self.checkpoint
+        entered = self.enter_attempted or self.enter_confirmed
+        telemetry = await self._request(runtime, "/telemetry")
+        validate_telemetry(telemetry)
+        status = str(telemetry.get("status", "")).lower()
+        if target == "awaiting_mid":
+            if status == "connected":
+                self.enter_confirmed = False
+            elif status == "calibration" and entered:
+                self.enter_confirmed = True
+            else:
+                reason = "Probe state does not match the pre-point checkpoint."
+        elif target in ("awaiting_return", "settling"):
+            if status != "connected":
+                reason = "Probe is not in normal measurement mode after confirmed exit."
+        elif status != "calibration":
+            reason = "Probe no longer reports the known calibration session."
+        if reason is None and status == "calibration":
+            seen_progress = self.seen_progress
+            result = await self._request(runtime, "/calibration-status")
+            reported_point = result.get("point")
+            expected_point = "mid" if target == "awaiting_high" else self.point
+            phase = result.get("calibration_status")
+            phase = phase.lower() if isinstance(phase, str) else None
+            if reported_point is not None and reported_point != expected_point:
+                reason = "Probe reported a different point; cannot reconcile this session."
+            elif target == "awaiting_mid" and phase != "idle":
+                reason = "Probe already has an unexpected point result/activity before mid confirmation."
+            elif target == "awaiting_high" and (phase != "success" or self.completed_points != ["mid"]):
+                reason = "Probe does not confirm the completed mid-point checkpoint."
+            elif target.startswith("calibrating_") and not (
+                phase == "in_progress" or (phase == "success" and seen_progress)
+            ):
+                reason = "Cannot resume acknowledged point from firmware status %r." % phase
+            if reason is None and target.startswith("calibrating_") and phase == "in_progress":
+                self.seen_progress = True
+        reason = reason or self._reconnect_expired(runtime)
+        if reason is not None:
+            await self._recovery(runtime, reason, kind="reconnect_unverified")
+            return
+        self.pending_write = None
+        self.reconnect_started = None
+        self.state = target
+        self.nonce = self.new_token()
+        self.last_poll = None
+        self.detail = ("Connection verified; confirm buffer placement again before proceeding."
+                       if target in ("awaiting_mid", "awaiting_high")
+                       else "Connection verified; continuing from the confirmed checkpoint.")
+        await self.announce(runtime)
+        await self.event(runtime, "reconnected", self.last_command_id, self.detail)
 
     async def connected(self, runtime):
         if self.inhibits_measurements:
             await runtime.publish(self.cfg.availability_topic, "offline")
+        if self.state == "reconnecting":
+            await self._verify_reconnect(runtime)
         await self.announce(runtime)
 
     def _decode(self, payload, retained, now):
@@ -295,6 +422,8 @@ class Calibration:
             raise CommandError("Wrong session_id.")
         if data.get("confirm") is not True:
             raise CommandError("Explicit confirm=true is required.")
+        if self.state == "reconnecting":
+            raise CommandError("Connection verification is pending; wait for a fresh workflow state.")
         if action == "point_ready":
             point = data.get("point")
             expected = "mid" if self.state == "awaiting_mid" else "high" if self.state == "awaiting_high" else None
@@ -337,6 +466,7 @@ class Calibration:
         if len(self.cache) > CACHE_LIMIT:
             self.cache.pop(0)
         self.last_command_id = data["command_id"]
+        self.last_action = data["action"]
         self.nonce = self.new_token()
         try:
             await self._act(runtime, data)
@@ -355,6 +485,11 @@ class Calibration:
         if action == "start":
             # Set the in-memory guard even if disk I/O fails part way through.
             self.state = "recovery_required"
+            self.checkpoint = None
+            self.reconnect_started = None
+            self.pending_write = None
+            self.reconnect_started = None
+            self.enter_attempted = self.enter_confirmed = False
             self.session_id = self.new_token()
             self.marker.set()
             self.completed_points = []
@@ -388,16 +523,13 @@ class Calibration:
             self.last_status = None
             self.buffer_telemetry_supported = True
             await self._sample_buffer(runtime)
-            if point == "mid":
+            if point == "mid" and not self.enter_confirmed:
                 self.enter_attempted = True
                 await self._post(runtime, "/calibration-enter", {"time": runtime.epoch()})
             await self._post(runtime, "/calibration-point-start", {
                 "point": point, "solution_ph": data["solution_ph"],
                 "solution_rated_temp": data["solution_rated_temp"],
             })
-            self.point_started = runtime.ticks()
-            self.last_poll = None
-            self.seen_progress = False
             await self._set_state(runtime, "calibrating_" + point, "Leave the probe in this buffer.")
         elif action == "cancel":
             if self.enter_attempted:
@@ -422,6 +554,7 @@ class Calibration:
             await self._set_state(runtime, "settling", "Return confirmed; waiting before aquarium measurements resume.")
 
     async def _post(self, runtime, path, payload=None):
+        self.pending_write = path
         result = await self._request(runtime, path, payload, method=POST)
         if result.get("success") is not True:
             raise ProbeError("Calibration write did not return explicit success=true.", result)
@@ -439,6 +572,8 @@ class Calibration:
             result = await self._request(runtime, "/calibration-status")
             self.last_status = result
             self.progress = result
+            if result.get("point", self.point) != self.point:
+                raise ProbeError("Calibration status belongs to a different point.", result)
             status = result.get("calibration_status")
             if not isinstance(status, str):
                 raise ProbeError("Missing calibration_status in probe response.")
@@ -451,7 +586,8 @@ class Calibration:
                 self.seen_progress = True
             elif status == "success" and self.seen_progress:
                 point = self.state[len("calibrating_"):]
-                self.completed_points.append(point)
+                if point not in self.completed_points:
+                    self.completed_points.append(point)
                 await self._sample_buffer(runtime)
                 await self.event(runtime, "point_completed", self.last_command_id,
                                  point=point, data=result, telemetry=self.last_telemetry)
@@ -481,6 +617,7 @@ class Calibration:
             validate_telemetry(telemetry)
             if str(telemetry.get("status", "")).lower() != "connected":
                 raise ProbeError("Probe is not in normal measurement state after return.")
+            self.checkpoint = None
             self.marker.clear()
             await self._set_state(runtime, "idle", "Monitoring resumed after explicit return and settle.")
             await self.event(runtime, "monitoring_resumed", self.last_command_id)
@@ -489,7 +626,11 @@ class Calibration:
 
     async def _recovery(self, runtime, message, kind="external_calibration"):
         self.record_failure(runtime, message, kind)
+        if self.state == "reconnecting" and self.last_failure is not None:
+            self.last_failure["reconciliation"] = {"kind": kind, "message": message, "ts": runtime.timestamp()}
+            self.failure_pending = True
         self.state = "recovery_required"
+        self.checkpoint = None
         self.detail = message
         self.nonce = self.new_token()
         await runtime.publish(self.cfg.availability_topic, "offline")

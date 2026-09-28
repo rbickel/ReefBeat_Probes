@@ -19,6 +19,7 @@ OVERRIDES = {
     # "calibration_poll_interval": 3,
     # "calibration_command_ttl": 120,
     # "calibration_settle_seconds": 30,
+    # "calibration_reconnect_timeout": 60,  # Verify checkpoints; never replay uncertain writes.
     # "calibration_marker_path": "calibration.pending",  # Persistent board filesystem.
     # "wifi_timeout": 60.0,  # Per attempt; recovery cycles continue forever.
     # "wifi_disable_power_save": True,  # Mains/USB-powered reliability.

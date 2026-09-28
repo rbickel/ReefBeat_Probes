@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from reef_probe_protocol import (
     SERVICE_UUID, WRITE_UUID, NOTIFY_UUID, GET, POST, REST, ACK, ERROR, MAX_RESPONSE,
-    ProbeError, ProbeRejected, request_packets, unpack_packet, Response,
+    ProbeError, ProbeRejected, ProbeConnectionError, request_packets, unpack_packet, Response,
     decode_response, validate_telemetry,
 )
 
@@ -106,7 +106,7 @@ class Probe:
             if self.disconnected.is_set():
                 if self.callback_error is not None:
                     raise self.callback_error
-                raise ProbeError("Bluetooth disconnected; probe state may be unknown.")
+                raise ProbeConnectionError("Bluetooth disconnected; probe state may be unknown.")
             return await task
         finally:
             for pending in (task, disconnected):
@@ -175,7 +175,7 @@ class Probe:
             if self.broken:
                 raise ProbeError("Previous exchange failed; reconnect before any more commands.")
             if not self.client.is_connected or self.disconnected.is_set():
-                raise ProbeError("Probe is disconnected.")
+                raise ProbeConnectionError("Probe is disconnected.")
             if not self.queue.empty():
                 self.broken = True
                 raise ProbeError("Unsolicited/stale notification before request; reconnect.")
@@ -215,7 +215,7 @@ class Probe:
                             self.broken = False
                             return result
             except TimeoutError as exc:
-                raise ProbeError(
+                raise ProbeConnectionError(
                     f"Timed out during {path}; no automatic retry. "
                     "Check notifications, MTU and the raw log, then reconnect."
                 ) from exc
