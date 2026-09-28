@@ -40,7 +40,7 @@ class Settings:
             "calibration_event_topic": "reef/sump_ph/calibration/event",
             "calibration_failure_topic": "reef/sump_ph/calibration/failure",
             "probe_diagnostics_topic": "reef/reef_probe/diagnostics",
-            "calibration_timeout": 360.0, "calibration_wait_timeout": 900.0,
+            "calibration_timeout": 420.0, "calibration_wait_timeout": 900.0,
             "calibration_poll_interval": 3.0, "calibration_command_ttl": 120,
             "calibration_settle_seconds": 30.0,
             "calibration_reconnect_timeout": 60.0,

@@ -79,6 +79,7 @@ class Calibration:
         self.outcome = None
         self.progress = None
         self.point = None
+        self.buffer_parameters = None
         self.point_requested_at = None
         self.last_exchange = None
         self.last_status = None
@@ -180,6 +181,7 @@ class Calibration:
             "last_telemetry": self.last_telemetry,
             "limits": {
                 "calibration_timeout": self.cfg.calibration_timeout,
+                "calibration_reconnect_timeout": self.cfg.calibration_reconnect_timeout,
                 "calibration_poll_interval": self.cfg.calibration_poll_interval,
                 "request_timeout": self.cfg.request_timeout, "mqtt_timeout": self.cfg.mqtt_timeout,
             },
@@ -221,12 +223,29 @@ class Calibration:
         if path == "/calibration-status":
             self.last_status = result
             self.progress = result
+            runtime.report("info", "Calibration %s status: %s, time_left=%s s, stability_progress=%s" % (
+                self.point, result.get("calibration_status", "not reported"),
+                result.get("time_left", "not reported"), result.get("stability_progress", "not reported"),
+            ))
             if (self.state.startswith("calibrating_")
                     and result.get("calibration_status") == "in_progress"
                     and result.get("point", self.point) == self.point):
                 self.seen_progress = True
         if path == "/telemetry":
             self.last_telemetry = exchange
+            if self.buffer_parameters is not None and self.inhibits_measurements:
+                runtime.report("info",
+                               "Calibration %s reading: pH=%s, raw_ph=%s, compensated_ph=%s, "
+                               "mv=%s, temperature=%s C; nominal_buffer=%s @ %s C; probe_status=%s" % (
+                                   self.point, result.get("value", "not reported"),
+                                   result.get("raw_ph", "not reported"),
+                                   result.get("compensated_ph", "not reported"),
+                                   result.get("mv", "not reported"),
+                                   result.get("temperature_value", "not reported"),
+                                   self.buffer_parameters["solution_ph"],
+                                   self.buffer_parameters["solution_rated_temp"],
+                                   result.get("status", "not reported"),
+                               ))
         await publish_document(runtime, topic, exchange)
         return result
 
@@ -237,6 +256,7 @@ class Calibration:
             await self._request(runtime, "/telemetry")
         except ProbeRejected as error:
             self.buffer_telemetry_supported = False
+            runtime.report("warning", "Calibration %s reading unavailable: %s" % (self.point, error_text(error)))
             await self.event(runtime, "diagnostic_unavailable", self.last_command_id,
                              str(error), path="/telemetry", data=error.response)
 
@@ -494,6 +514,7 @@ class Calibration:
             self.marker.set()
             self.completed_points = []
             self.point = self.point_started = self.point_requested_at = None
+            self.buffer_parameters = None
             self.last_status = None
             self.last_telemetry = None
             self.outcome = None
@@ -518,6 +539,10 @@ class Calibration:
         elif action == "point_ready":
             point = data["point"]
             self.point = point
+            self.buffer_parameters = {
+                "point": point, "solution_ph": data["solution_ph"],
+                "solution_rated_temp": data["solution_rated_temp"],
+            }
             self.point_requested_at = runtime.ticks()
             self.point_started = None
             self.last_status = None
@@ -526,10 +551,7 @@ class Calibration:
             if point == "mid" and not self.enter_confirmed:
                 self.enter_attempted = True
                 await self._post(runtime, "/calibration-enter", {"time": runtime.epoch()})
-            await self._post(runtime, "/calibration-point-start", {
-                "point": point, "solution_ph": data["solution_ph"],
-                "solution_rated_temp": data["solution_rated_temp"],
-            })
+            await self._post(runtime, "/calibration-point-start", self.buffer_parameters)
             await self._set_state(runtime, "calibrating_" + point, "Leave the probe in this buffer.")
         elif action == "cancel":
             if self.enter_attempted:

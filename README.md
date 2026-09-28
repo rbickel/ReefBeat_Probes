@@ -595,6 +595,29 @@ are preserved; malformed JSON/protocol error packets include raw hex when availa
 This covers the existing allowlisted endpoints, not arbitrary/undocumented firmware
 operations or a complete raw BLE packet log.
 
+Calibration readings and status are also logged at INFO level in the Pico/Thonny
+console and Linux journal. For example (illustrative values):
+
+```text
+[pico] info Calibration mid status: in_progress, time_left=123 s, stability_progress=42
+[pico] info Calibration mid reading: pH=7.2, raw_ph=7.2, compensated_ph=7.2, mv=-8, temperature=24.4 C; nominal_buffer=7.0 @ 25 C; probe_status=calibration
+```
+
+These lines are emitted after receiving the BLE response, **before** publishing
+the diagnostic to MQTT, so a later MQTT failure does not hide the console reading.
+They use the existing buffer/status requests, normally every three seconds plus
+I/O time; no extra probe requests or aquarium publications are added. Missing
+optional fields are shown as `not reported`; a rejected buffer reading logs a
+warning rather than substituting an earlier sample.
+
+`nominal_buffer` is the selected label value and reference temperature, not a
+computed acceptance limit. The actual buffer pH can differ with temperature.
+Watch `mv` as well as pH: the electrode must respond to and stabilize in the
+solution; calibration does not gradually force an arbitrary pH toward the target.
+Displayed pH depends on the firmware's currently applied coefficients and may
+change when a calibration point is stored. A moving value alone is not a
+successful calibration or an independent accuracy check.
+
 On failure, `reef/sump_ph/calibration/failure` stores the initiating reason,
 failure kind, original stage/point, elapsed seconds, timeout settings, completed
 points, last exchange, full last status/telemetry, and transport state. A `failed`
@@ -624,10 +647,13 @@ explicit references to their full diagnostic topic so control tokens stay usable
 This does not remove the firmware parser's 64 KiB response ceiling or the Pico's
 finite memory limits.
 
-No reset, automatic calibration retry, acceptance-range guess, or timeout
-increase is introduced. The host still requires `in_progress` then `success`;
-the probe owns stabilization, with a 360-second host deadline. A simulated
-180-second high-point run and each known `fail_*` status are covered offline.
+No reset, automatic calibration-write replay, or acceptance-range guess is
+introduced. The host still requires `in_progress` then `success`; the probe owns
+stabilization, with a fixed 420-second host deadline. Live firmware 1.1.8 status
+still showed `in_progress` with three seconds remaining at the old 360-second
+boundary, so the seven-minute default allows margin for polling and transport.
+This does not promise success or extend the deadline after reconnection.
+Simulated three- and six-minute runs and each known `fail_*` status are covered offline.
 Without the original failure response, these checks cannot establish the cause
 of a past physical calibration failure.
 
@@ -723,9 +749,11 @@ temperature. For a 7.00-at-25-C buffer:
 The host sends `/calibration-enter` with current Unix time, then
 `/calibration-point-start`. It publishes `calibrating_mid` and polls
 `/calibration-status` every 3 seconds. Keep the probe in the buffer.
-The manual describes approximately 3 minutes per point; the host allows 360
+The manual describes approximately 3 minutes per point; the host allows 420
 seconds and requires observed `in_progress` followed by `success`, not a stale
-success from a previous point.
+success from a previous point. Some observed firmware countdowns run about six
+minutes; the host deadline leaves one minute of margin rather than cutting off
+at the same boundary. Explicit board overrides of 360 must be updated or removed.
 
 Allowed nominal values match the APK: mid `6.865`, `7.00`, `7.01`; high `9.18`,
 `10.00`, `10.01`, `10.012`; rated temperatures are integer `20` or `25`. Choose
@@ -923,7 +951,7 @@ Shared configurable limits:
 
 | Setting | Default |
 |---|---:|
-| `calibration_timeout` | 360 seconds per point |
+| `calibration_timeout` | 420 seconds per point |
 | `calibration_wait_timeout` | 900 seconds awaiting each buffer |
 | `calibration_poll_interval` | 3 seconds |
 | `calibration_command_ttl` | 120 seconds maximum |
@@ -1005,7 +1033,7 @@ It logs config and both existing point histories before writing, then sends:
 
 `fail_*`, unknown states, missing acknowledgements, disconnects, and deadlines
 abort the procedure. A stale `success` without observed progress is not accepted.
-The per-point timeout defaults to 360 seconds (`--calibration-timeout`).
+The per-point timeout defaults to 420 seconds (`--calibration-timeout`).
 If firmware completes without exposing `in_progress`, inspect its logs before
 changing this conservative rule.
 

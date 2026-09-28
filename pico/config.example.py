@@ -14,7 +14,7 @@ OVERRIDES = {
     # "calibration_event_topic": "reef/sump_ph/calibration/event",
     # "calibration_failure_topic": "reef/sump_ph/calibration/failure",
     # "probe_diagnostics_topic": "reef/reef_probe/diagnostics",
-    # "calibration_timeout": 360,  # Single point deadline.
+    # "calibration_timeout": 420,  # Single point deadline, including firmware countdown margin.
     # "calibration_wait_timeout": 900,  # Operator wait deadline.
     # "calibration_poll_interval": 3,
     # "calibration_command_ttl": 120,

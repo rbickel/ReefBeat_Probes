@@ -347,6 +347,37 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.completed_points, ["mid", "high"])
         self.assertEqual(self.events("point_completed")[-1]["data"]["firmware_extra"], "final")
 
+    async def test_six_minute_firmware_countdown_gets_margin_without_assuming_success(self):
+        await self.send("start")
+        await self.start_point("mid")
+        started = self.controller.point_started
+        for elapsed in range(0, 360, 3):
+            self.runtime.now = started + elapsed
+            self.runtime.statuses = [{"calibration_status": "in_progress", "time_left": 360 - elapsed}]
+            await self.controller.tick(self.runtime)
+            self.assertEqual(self.controller.state, "calibrating_mid")
+        self.runtime.now = started + 360.574
+        self.runtime.statuses = [{"calibration_status": "in_progress", "time_left": 1}]
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "calibrating_mid")
+        self.assertEqual(self.controller.completed_points, [])
+        self.runtime.now += 3
+        self.runtime.statuses = [{"calibration_status": "success", "time_left": 0}]
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "awaiting_high")
+        self.assertEqual(self.controller.completed_points, ["mid"])
+
+    async def test_default_seven_minute_deadline_still_stops_a_never_ending_point(self):
+        self.assertEqual(self.cfg.calibration_timeout, 420.0)
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.now += 420
+        before = list(self.runtime.calls)
+        await self.controller.tick(self.runtime)
+        self.assertEqual(self.controller.state, "recovery_required")
+        self.assertEqual(self.controller.last_failure["kind"], "point_timeout")
+        self.assertEqual(self.runtime.calls, before)
+
     async def test_mqtt_failure_after_status_response_preserves_evidence_for_reconnect(self):
         await self.send("start")
         await self.start_point("mid")
@@ -459,6 +490,61 @@ class CalibrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(docs[-1]["response"], self.runtime.telemetry)
         self.assertFalse(any(topic in (self.cfg.ph_topic, self.cfg.temperature_topic)
                              for topic, _, _ in self.runtime.published))
+
+    async def test_calibration_readings_log_measured_values_and_nominal_buffer(self):
+        await self.send("start")
+        self.runtime.telemetry.update(value=10.2, raw_ph=10.21, compensated_ph=10.2,
+                                      mv=-180.5, temperature_value=24.4)
+        await self.start_point("mid")
+        self.runtime.report.reset_mock()
+        for ph, mv in ((9.1, -125), (7.2, -8)):
+            self.runtime.telemetry.update(value=ph, raw_ph=ph, compensated_ph=ph,
+                                          mv=mv, status="calibration")
+            self.runtime.statuses = [{
+                "calibration_status": "in_progress", "time_left": 123,
+                "stability_progress": "42",
+            }]
+            await self.controller.tick(self.runtime)
+            self.runtime.now += 3
+        messages = [call.args[1] for call in self.runtime.report.call_args_list
+                    if call.args[0] == "info"]
+        readings = [message for message in messages if "reading:" in message]
+        self.assertEqual(len(readings), 2)
+        self.assertIn("pH=9.1", readings[0])
+        self.assertIn("mv=-125", readings[0])
+        self.assertIn("pH=7.2", readings[1])
+        self.assertIn("mv=-8", readings[1])
+        self.assertTrue(all("mid" in message and "raw_ph=" in message
+                            and "compensated_ph=" in message and "temperature=24.4 C" in message
+                            and "nominal_buffer=7 @ 25 C" in message
+                            and "probe_status=calibration" in message for message in readings))
+        self.assertTrue(any("in_progress" in message and "time_left=123 s" in message
+                            and "stability_progress=42" in message for message in messages))
+        self.assertFalse(any(topic in (self.cfg.ph_topic, self.cfg.temperature_topic)
+                             for topic, _, _ in self.runtime.published))
+
+    async def test_reading_logged_before_diagnostic_publish_can_fail(self):
+        await self.send("start")
+        await self.start_point("mid")
+        self.runtime.report.reset_mock()
+        self.runtime.telemetry.update(value=8.5, mv=-85)
+        self.runtime.publish = AsyncMock(side_effect=OSError("broker unavailable"))
+        with self.assertRaises(OSError):
+            await self.controller._sample_buffer(self.runtime)
+        self.assertTrue(any(call.args[0] == "info" and "pH=8.5" in call.args[1]
+                            and "mv=-85" in call.args[1]
+                            for call in self.runtime.report.call_args_list))
+
+    async def test_optional_reading_fields_are_not_fabricated_and_high_target_is_updated(self):
+        await self.send("start")
+        await self.start_point("mid")
+        await self.complete_point()
+        self.runtime.report.reset_mock()
+        await self.start_point("high")
+        messages = [call.args[1] for call in self.runtime.report.call_args_list]
+        self.assertTrue(any("high reading:" in message and "nominal_buffer=10 @ 25 C" in message
+                            and "raw_ph=not reported" in message
+                            and "compensated_ph=not reported" in message for message in messages))
 
     async def test_unsupported_buffer_telemetry_is_explicit_and_not_retried_each_poll(self):
         await self.send("start")

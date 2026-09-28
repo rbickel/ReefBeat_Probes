@@ -71,7 +71,7 @@ the exact topic, never a wildcard. The defaults are:
 | `calibration_event_topic` | `reef/sump_ph/calibration/event` |
 | `calibration_failure_topic` | `reef/sump_ph/calibration/failure` |
 | `probe_diagnostics_topic` | `reef/reef_probe/diagnostics` |
-| `calibration_timeout` | 360 seconds |
+| `calibration_timeout` | 420 seconds |
 | `calibration_wait_timeout` | 900 seconds |
 | `calibration_poll_interval` | 3 seconds |
 | `calibration_command_ttl` | 120 seconds |
@@ -184,6 +184,16 @@ No buffer readings are sent to aquarium state topics. Large documents use
 bounded, lossless chunks rather than aborting calibration at the MQTT packet
 size limit. See [diagnostic formats and limitations](../README.md#firmware-diagnostics-and-preserved-failures).
 Do not factory-reset or repeat calibration just to collect logs.
+
+During a point, INFO logs now show the firmware's pH, raw/compensated pH,
+millivolts, temperature and status alongside the selected nominal buffer
+and its rated temperature. A separate line shows the reported remaining
+seconds and stability progress. The existing diagnostic reads are reused,
+normally every three seconds plus I/O time, including the final reading when
+available. No buffer readings are published as aquarium measurements.
+Copy the updated `reef_calibration.py` to the board root and restart the
+interpreter when the active calibration/recovery flow is finished to enable
+these logs; no Home Assistant changes are required.
 
 When updating the publisher, copy both `reef_mqtt.py` and `reef_mqtt_payload.py`
 from the same version, then restart the interpreter to discard cached imports.

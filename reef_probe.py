@@ -479,7 +479,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             sub.add_argument("--high-ph", type=float, choices=(9.18, 10.0, 10.01, 10.012), required=True)
             sub.add_argument("--mid-rated-temp", type=int, choices=(20, 25), required=True)
             sub.add_argument("--high-rated-temp", type=int, choices=(20, 25), required=True)
-            sub.add_argument("--calibration-timeout", type=positive_float, default=360)
+            sub.add_argument("--calibration-timeout", type=positive_float, default=420)
     args = parser.parse_args(argv)
     if args.command == "calibrate" and (
         not sys.platform.startswith("linux") or not sys.stdin.isatty()
