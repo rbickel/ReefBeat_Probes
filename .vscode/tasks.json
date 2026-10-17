@@ -1,0 +1,30 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Guided ReefSense pH calibration (direct BLE)",
+			"type": "shell",
+			"command": "/home/raphael/Documents/ReefBeat_Probes/.venv/bin/python",
+			"args": [
+				"-u",
+				"reef_probe.py",
+				"calibrate",
+				"--address",
+				"88:56:A6:5B:03:56",
+				"--confirm-calibration",
+				"--mid-ph",
+				"7.00",
+				"--mid-rated-temp",
+				"25",
+				"--high-ph",
+				"10.00",
+				"--high-rated-temp",
+				"25",
+				"--calibration-timeout",
+				"600"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

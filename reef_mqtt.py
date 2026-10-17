@@ -10,7 +10,7 @@ from reef_mqtt_diagnostics import publish_document
 
 # Shared installation defaults. Credentials are loaded by the platform adapter.
 POLL_INTERVAL_SECONDS = 60.0
-PROBE_ADDRESS = "88:56:A6:5B:03:56"
+PROBE_ADDRESS = "B0:A6:04:25:BA:7E"
 MQTT_HOST = "192.168.50.177"
 MQTT_PORT = 1883
 PH_TOPIC = "reef/sump_ph/state"
