@@ -372,6 +372,149 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hardware.clients[0].publications, [])
         self.assertTrue(self.runtime.mqtt_connected())
 
+    async def test_temperature_opt_in_subscribes_and_writes_only_the_user_offset(self):
+        from reef_probe_protocol import unpack_packet
+
+        self.settings.temperature_calibration_enabled = True
+        await self.runtime.prepare()
+        self.assertEqual(self.runtime.publisher.command_topics, (
+            self.settings.read_command_topic.encode(), self.settings.calibration_command_topic.encode(),
+        ))
+        await self.runtime.connect_probe()
+        self.runtime.writer.packets = fragments({"success": True})
+        payload = {"offset": 0.5, "last_adjustment_date": self.runtime.epoch()}
+        self.assertEqual(await self.runtime.request("/offset", payload, POST), {"success": True})
+        raw = b"".join(unpack_packet(data)[2] for data in self.runtime.writer.writes)
+        path, encoded = raw[1:].split(b"\0", 1)
+        self.assertEqual((raw[0], path), (POST, b"/offset"))
+        self.assertEqual(json.loads(encoded[:-1]), payload)
+        count = len(self.runtime.writer.writes)
+        for path in ("/factory-offset", "/config", "/calibration-enter", "/calibration-point-start"):
+            with self.subTest(path=path), self.assertRaises(ProbeError):
+                await self.runtime.request(path, {}, POST)
+        for bad in (
+            {"offset": 2.01, "last_adjustment_date": self.runtime.epoch()},
+            {"offset": 0.5, "last_adjustment_date": True},
+        ):
+            with self.subTest(payload=bad), self.assertRaises(ProbeError):
+                await self.runtime.request("/offset", bad, POST)
+        self.assertEqual(len(self.runtime.writer.writes), count)
+        self.assertFalse(self.settings.calibration_enabled)
+
+    async def test_temperature_firmware_write_requires_its_own_authorization(self):
+        self.settings.temperature_calibration_enabled = False
+        self.settings.calibration_enabled = True
+        with self.assertRaises(ProbeError):
+            await self.runtime.request("/offset", {"offset": 0.5, "last_adjustment_date": 1800000000}, POST)
+        self.assertEqual(self.hardware.connections, [])
+
+    async def test_discovered_temperature_control_runs_through_mqtt_ble_and_settling(self):
+        from datetime import datetime, timezone
+        from jinja2 import Environment
+        from reef_probe_protocol import Response, unpack_packet
+        from test_pico_mqtt import command
+        from test_reef_calibration import MemoryMarker
+        from test_reef_temperature import CONFIG
+
+        self.settings.temperature_calibration_enabled = True
+        self.runtime.led = None
+        marker = MemoryMarker()
+        config = dict(CONFIG)
+        telemetry = dict(TELEMETRY)
+        requests = []
+        assembling = Response()
+        stop = asyncio.Event()
+        sent = False
+        real_sleep = asyncio.sleep
+        connect_probe = self.runtime.connect_probe
+        publish = self.runtime.publish
+
+        async def write(data, response, timeout_ms):
+            nonlocal assembling
+            self.assertTrue(response)
+            self.assertGreater(timeout_ms, 0)
+            self.runtime.writer.writes.append(data)
+            remaining, kind, body = unpack_packet(data)
+            self.assertEqual(kind, 1)
+            raw = assembling.add(remaining, body)
+            if raw is None:
+                return
+            assembling = Response()
+            path, encoded = raw[1:].split(b"\0", 1)
+            path = path.decode()
+            payload = json.loads(encoded[:-1]) if encoded else None
+            requests.append((raw[0], path, payload))
+            if path == "/config":
+                result = dict(config)
+            elif path == "/telemetry":
+                result = dict(telemetry)
+            elif path == "/offset":
+                self.assertTrue(marker.pending)
+                self.assertEqual(raw[0], POST)
+                config["temp_offset"] += payload["offset"]
+                config["temp_last_adjustment_date"] = payload["last_adjustment_date"]
+                telemetry["temperature_value"] += payload["offset"]
+                result = {"success": True}
+            else:
+                self.fail("Unexpected temperature-calibration request: " + path)
+            for part in fragments(result):
+                self.runtime.notify.emit(part)
+            await real_sleep(0)
+
+        async def connect_and_script_probe():
+            await connect_probe()
+            self.runtime.writer.write = write
+
+        async def virtual_sleep(seconds):
+            nonlocal sent
+            self.clock.advance(seconds)
+            client = self.hardware.clients[0]
+            if not sent and any(topic.decode() == self.settings.temperature_topic
+                                for topic, _, _, _ in client.publications):
+                sent = True
+                control = [json.loads(payload) for topic, payload, _, _ in client.publications
+                           if topic.endswith(b"/temperature_calibration/config")][-1]
+                renderer = Environment()
+                clock = datetime.fromtimestamp(self.runtime.epoch(), timezone.utc)
+                renderer.globals.update(now=lambda: clock, as_timestamp=lambda value: value.timestamp())
+                payload = renderer.from_string(control["command_template"]).render(value="25.9")
+                client.sock.feed(command(payload.encode()))
+            await real_sleep(0)
+
+        async def publish_and_stop(topic, payload, retain=True):
+            await publish(topic, payload, retain=retain)
+            if topic == self.settings.temperature_topic:
+                values = [json.loads(value)["value"] for target, value, _, _
+                          in self.hardware.clients[0].publications
+                          if target.decode() == self.settings.temperature_topic]
+                if len(values) == 2:
+                    self.assertFalse(marker.pending)
+                    self.assertGreaterEqual(self.clock.value, 45000)
+                    stop.set()
+
+        with (
+            patch("reef_calibration.PendingMarker", return_value=marker),
+            patch.object(self.runtime, "connect_probe", side_effect=connect_and_script_probe),
+            patch.object(self.runtime, "publish", side_effect=publish_and_stop),
+            patch.object(pico_runtime.asyncio, "sleep", virtual_sleep),
+        ):
+            await asyncio.wait_for(
+                reef_mqtt.run_bridge(self.settings, self.runtime, stop), timeout=2,
+            )
+        writes = [request for request in requests if request[0] == POST]
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][1], "/offset")
+        self.assertAlmostEqual(writes[0][2]["offset"], 0.5)
+        self.assertAlmostEqual(config["temp_offset"], CONFIG["temp_offset"] + 0.5)
+        for key, value in CONFIG.items():
+            if key not in ("temp_offset", "temp_last_adjustment_date"):
+                self.assertEqual(config[key], value)
+        values = [json.loads(payload)["value"] for topic, payload, _, _
+                  in self.hardware.clients[0].publications
+                  if topic.decode() == self.settings.temperature_topic]
+        self.assertEqual(values, [25.4, 25.9])
+        self.assertEqual((marker.sets, marker.clears), (1, 1))
+
     async def test_busy_calibration_diagnostics_do_not_ping_for_every_operation(self):
         self.settings.calibration_enabled = True
         await self.runtime.prepare()
@@ -1563,9 +1706,37 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(settings.username, local_config.MQTT_USERNAME)
         self.assertEqual(settings.mqtt_timeout, 3.0)
         self.assertFalse(settings.discovery_enabled)
+        self.assertTrue(settings.temperature_calibration_enabled)
+        self.assertFalse(settings.calibration_enabled)
+        keys = {topic.split("/")[-2] for topic, _ in reef_mqtt.discovery_messages(settings)}
+        self.assertIn("temperature_calibration", keys)
+        self.assertIn("temperature_offset", keys)
+        self.assertNotIn("temperature_calibration_enabled", local_config.OVERRIDES)
         canonical_loop.assert_awaited_once()
         self.assertIs(canonical_loop.call_args.args[0], settings)
         self.assertIs(canonical_loop.call_args.args[1], runtime_factory.return_value)
+
+    def test_adapter_main_preserves_explicit_temperature_calibration_overrides(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                local_config = SimpleNamespace(
+                    WIFI_SSID="offline-test-ssid", WIFI_PASSWORD="",
+                    MQTT_USERNAME="reefpi", MQTT_PASSWORD="offline-test-placeholder",
+                    MQTT_CLIENT_ID="pico-unit-test",
+                    OVERRIDES={"temperature_calibration_enabled": enabled},
+                )
+                runtime_factory = Mock()
+                with (
+                    patch.dict(sys.modules, {"config": local_config}),
+                    patch.object(pico_runtime, "Runtime", runtime_factory),
+                    patch.object(reef_mqtt, "run_bridge", new=AsyncMock()),
+                ):
+                    pico_runtime.main()
+                settings = runtime_factory.call_args.args[0]
+                self.assertIs(settings.temperature_calibration_enabled, enabled)
+                self.assertFalse(settings.calibration_enabled)
+                self.assertEqual(len(list(reef_mqtt.discovery_messages(settings))),
+                                 10 if enabled else 8)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from reef_probe_protocol import (
     ACK, GET, POST, REST, SERVICE_UUID, WRITE_UUID, NOTIFY_UUID, ProbeError, ProbeRejected,
     ProbeConnectionError,
     Response, decode_response, request_packets, unpack_packet, validate_telemetry,
+    TEMPERATURE_OFFSET_PATH, validate_temperature_offset_payload,
 )
 
 
@@ -371,7 +372,9 @@ class Runtime:
             )
             self.publisher = Publisher(
                 client, cfg.availability_topic, cfg.mqtt_timeout, cfg.qos,
-                command_topic=cfg.calibration_command_topic if cfg.calibration_enabled is True else None,
+                command_topic=cfg.calibration_command_topic if (
+                    cfg.calibration_enabled is True or cfg.temperature_calibration_enabled is True
+                ) else None,
                 read_command_topic=cfg.read_command_topic,
             )
             self.publisher.connect()
@@ -473,9 +476,14 @@ class Runtime:
         if not isinstance(method, int) or isinstance(method, bool) or (
             method == GET and path not in READ_PATHS
         ) or (
-            method == POST and (path not in WRITE_PATHS or self.settings.calibration_enabled is not True)
+            method == POST and not (
+                path in WRITE_PATHS and self.settings.calibration_enabled is True
+                or path == TEMPERATURE_OFFSET_PATH and self.settings.temperature_calibration_enabled is True
+            )
         ) or method not in (GET, POST):
             raise ProbeError("Probe operation is not allowed")
+        if path == TEMPERATURE_OFFSET_PATH:
+            validate_temperature_offset_payload(payload)
         progress = {"stage": "waiting for serialized BLE request", "started": self.ticks()}
         try:
             return await asyncio.wait_for(
@@ -546,6 +554,7 @@ def main():
     from reef_mqtt import Settings, run_bridge
 
     overrides = dict(getattr(config, "OVERRIDES", {}))
+    overrides.setdefault("temperature_calibration_enabled", True)
     for field, name in (
         ("wifi_ssid", "WIFI_SSID"), ("wifi_password", "WIFI_PASSWORD"),
         ("username", "MQTT_USERNAME"), ("password", "MQTT_PASSWORD"),

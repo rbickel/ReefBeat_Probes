@@ -11,6 +11,8 @@ NOTIFY_UUID = "b474e9ff-f949-4c55-a329-a39102005093"
 GET, POST = 1, 3
 REST, ACK, ERROR = 1, 4, 5
 MAX_RESPONSE = 65536
+TEMPERATURE_OFFSET_PATH = "/offset"
+MAX_TEMPERATURE_CORRECTION_C = 2.0
 
 
 class ProbeError(Exception):
@@ -27,6 +29,23 @@ class ProbeRejected(ProbeError):
 
 class ProbeConnectionError(ProbeError):
     """Connection loss or response timeout, not a firmware/protocol rejection."""
+
+
+def validate_temperature_offset_payload(payload):
+    if not isinstance(payload, dict) or set(payload) != {"offset", "last_adjustment_date"}:
+        raise ProbeError("Temperature adjustment requires offset and last_adjustment_date only.")
+    offset = payload["offset"]
+    if (
+        isinstance(offset, bool) or not isinstance(offset, (int, float))
+        or not math.isfinite(offset) or abs(offset) > MAX_TEMPERATURE_CORRECTION_C
+    ):
+        raise ProbeError("Temperature correction must be finite and within +/-2 C.")
+    timestamp = payload["last_adjustment_date"]
+    if (
+        isinstance(timestamp, bool) or not isinstance(timestamp, int)
+        or not 0 < timestamp <= 0xFFFFFFFFFFFFFFFF
+    ):
+        raise ProbeError("Temperature adjustment date must be positive integer Unix seconds.")
 
 
 def _finite_numbers(value):

@@ -60,7 +60,7 @@ class CommandPublisherTests(unittest.TestCase):
 
     def subscribe(self, topics: list[tuple[str, int]]) -> tuple[int, int]:
         expected = [(self.settings.read_command_topic, 1)]
-        if self.settings.calibration_enabled:
+        if self.settings.calibration_enabled or self.settings.temperature_calibration_enabled:
             expected.append((self.settings.calibration_command_topic, 1))
         self.assertEqual(topics, expected)
         if self.retained_delivery:
@@ -103,6 +103,19 @@ class CommandPublisherTests(unittest.TestCase):
         )
         self.assertTrue(self.publisher.ready.is_set())
         self.client.publish.assert_not_called()
+
+    def test_temperature_only_opt_in_subscribes_to_protected_commands(self) -> None:
+        self.settings.calibration_enabled = False
+        self.settings.temperature_calibration_enabled = True
+        self.publisher.connect()
+        self.client.subscribe.assert_called_once_with(
+            [(self.settings.read_command_topic, 1), (self.settings.calibration_command_topic, 1)],
+        )
+        self.deliver(b'{"action":"temperature_reference"}')
+        self.assertEqual(self.publisher.commands(), [
+            (self.settings.calibration_command_topic, b'{"action":"temperature_reference"}', False),
+        ])
+        self.assertFalse(self.settings.calibration_enabled)
 
     def test_broker_check_never_subscribes_even_if_settings_enable_calibration(self) -> None:
         self.publisher.check_only = True
@@ -346,6 +359,23 @@ class CommandRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 assert self.runtime.probe is not None
                 self.assertIs(self.runtime.probe.allow_calibration, enabled)
 
+    async def test_probe_temperature_gate_is_independent_of_ph_calibration(self) -> None:
+        self.settings.calibration_enabled = False
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                patch("reef_mqtt_linux.BleakScanner.find_device_by_address", new=AsyncMock(
+                    return_value=BLEDevice(self.settings.address, "test", None),
+                )),
+                patch("reef_mqtt_linux.BleakClient", return_value=self.client),
+                patch("reef_mqtt_linux.Probe.start", new=AsyncMock()),
+            ):
+                self.settings.temperature_calibration_enabled = enabled
+                await self.runtime.connect_probe()
+                assert self.runtime.probe is not None
+                self.assertIs(self.runtime.probe.allow_temperature_calibration, enabled)
+                self.assertFalse(self.runtime.probe.allow_calibration)
+
     async def test_generic_request_passes_method_and_payload_unchanged(self) -> None:
         probe = Mock(spec=Probe)
         probe.request = AsyncMock(return_value={"success": True})
@@ -514,6 +544,24 @@ class CommandRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CommandModesAndClockTests(unittest.TestCase):
+    def test_cli_temperature_opt_in_is_separate_and_rejects_non_daemon_modes(self) -> None:
+        with (
+            patch.dict(os.environ, {"MQTT_USERNAME": "test", "MQTT_PASSWORD": "unused"}, clear=True),
+            patch("reef_mqtt_linux.run", new=AsyncMock()) as run,
+        ):
+            self.assertEqual(bridge.main(["--enable-temperature-calibration"]), 0)
+            self.assertTrue(run.call_args.args[0].temperature_calibration_enabled)
+            self.assertFalse(run.call_args.args[0].calibration_enabled)
+        for mode in ("--once", "--dry-run", "--check-broker"):
+            with (
+                self.subTest(mode=mode),
+                contextlib.redirect_stderr(io.StringIO()),
+                patch("reef_mqtt_linux.run", new=AsyncMock()) as run,
+            ):
+                with self.assertRaises(SystemExit):
+                    bridge.main(["--enable-temperature-calibration", mode])
+                run.assert_not_awaited()
+
     def test_epoch_is_integer_utc_unix_seconds(self) -> None:
         now = datetime(2026, 9, 27, 12, 0, 0, 999999, tzinfo=timezone.utc)
         with patch("reef_mqtt_linux.datetime") as clock:

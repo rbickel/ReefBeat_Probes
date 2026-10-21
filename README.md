@@ -119,11 +119,17 @@ integration automatically discovers one **ReefSense probe** device containing:
 | Last reading | Diagnostic timestamp | Measurement receive timestamp `ts` |
 | Calibration status | Diagnostic sensor | `disabled`, or the calibration controller's current stage |
 
+Enabling firmware temperature calibration adds two more entities on the same
+device: **Calibrate temperature** (reference-temperature configuration control)
+and **Temperature offset** (read-only firmware diagnostic). Pico W enables these
+by default; Linux keeps its explicit opt-in. See
+[temperature calibration](#firmware-temperature-calibration).
+
 MQTT discovery must be enabled in Home Assistant with the matching prefix
 (default `homeassistant`). All entities share a stable probe-address-based device
 identifier and unique IDs, including when switching between Linux and Pico W.
-pH and temperature reuse the existing measurement topics and units; all numeric
-sensors use measurement state classes. Sensors expire after the greater of 180 seconds or three polling
+pH and temperature reuse the existing measurement topics and units; these and the
+raw-voltage sensors use measurement state classes. Sensors expire after the greater of 180 seconds or three polling
 intervals and honor measurement availability.
 
 Raw voltages and probe status use a small retained
@@ -131,8 +137,9 @@ Raw voltages and probe status use a small retained
 `reef/reef_probe/diagnostics/summary`). Full firmware responses remain available
 on the existing diagnostic topics, including lossless chunking for large
 responses. The summary prevents large responses from breaking diagnostic
-templates. No extra BLE requests are needed for discovery or these diagnostics.
-Calibration status shows `disabled` unless calibration is explicitly enabled.
+templates. These basic telemetry diagnostics reuse normal polling. Temperature
+calibration additionally reads firmware configuration on connection.
+Calibration status shows `disabled` when both calibration features are disabled.
 When enabled it follows the controller state and uses expiry, not aquarium
 measurement availability, so it stays visible while calibration deliberately
 marks aquarium readings offline. Discovery does not authorize calibration.
@@ -155,7 +162,7 @@ To remove an old discovery configuration, publish an empty retained payload to
 its corresponding discovery `config` topic.
 
 Configurations are retained at
-`<discovery_prefix>/<sensor-or-button>/reef_probe_<probe-address>/<entity>/config`
+`<discovery_prefix>/<sensor-number-or-button>/reef_probe_<probe-address>/<entity>/config`
 (address lowercased without colons/hyphens). Broker ACLs must allow the bridge to
 publish those topics and Home Assistant to receive them. If you previously
 created manual MQTT entities, disable or remove their definitions before using
@@ -205,6 +212,97 @@ calibration, recovery, or settling, measurement availability keeps the button
 unavailable, and read requests cannot bypass the calibration interlock.
 `--once` and `--check-broker` do not publish discovery;
 `--dry-run` only prints a preview and never contacts MQTT.
+
+### Firmware temperature calibration
+
+ReefBeat 8.1.7 has a reference-temperature adjustment screen. Its flow computes
+`reference temperature - current probe temperature`. The BLE SDK serializes
+`offset` and `last_adjustment_date`; static analysis of the locally downloaded
+ReefSense pH firmware 1.1.3/1.1.8 confirms **POST `/offset` adds this correction
+to the probe's stored `temp_offset`**. This is separate from `/factory-offset`.
+Existing probe captures also expose `temp_offset`, `temp_last_adjustment_date`,
+and `mtc_temp_lag_sec` in GET `/config`.
+
+This implementation uses that **firmware user-offset operation**, not a
+display-only addition to MQTT temperature. The probe remains responsible for
+temperature readings and temperature-compensated pH. Factory temperature
+calibration and pH coefficients are not intentionally modified. **The new write
+flow has offline tests and static firmware evidence, not physical calibration
+or accuracy validation.** Do not use experimental readings for automated dosing.
+
+The temperature-calibration control is **enabled by default on Pico W**.
+No firmware offset is written on startup: a manual reference-temperature command
+with confirmation is still required. To disable the control in local configuration:
+
+```python
+OVERRIDES["temperature_calibration_enabled"] = False
+```
+
+An existing explicit `False` override remains respected; change it to `True`
+to enable the control. An omitted setting uses the new Pico default.
+Keep `calibration_enabled=False` unless you also intend to enable pH calibration.
+The flags are independent; enabling the temperature control never authorizes pH
+calibration, factory-offset changes, resets, or arbitrary writes. Linux remains
+opt-in through `--enable-temperature-calibration`, preserving its read-only,
+one-shot, dry-run, and broker-check defaults. Neither Linux calibration opt-in may
+be used with `--once`, `--dry-run`, or `--check-broker`.
+
+Update the board-root copies of [reef_mqtt.py](reef_mqtt.py),
+[reef_calibration.py](reef_calibration.py),
+[reef_probe_protocol.py](reef_probe_protocol.py), and
+[pico_runtime.py](pico/pico_runtime.py) together, preserve local credentials, and
+restart the Pico. Linux also needs the updated [reef_probe.py](reef_probe.py) and
+[reef_mqtt_linux.py](reef_mqtt_linux.py).
+
+With discovery enabled, Home Assistant adds:
+
+- **Calibrate temperature**, a number in the device's **Configuration** section.
+  It displays the latest probe temperature. Enter the **actual calibrated
+  reference temperature**, not an offset; submitting a new value requests a
+  firmware calibration. Units are native Celsius, with 0.1-degree input steps,
+  matching the app's reference-entry precision.
+- **Temperature offset**, a diagnostic sensor showing the probe's current
+  `temp_offset`, including an offset read back after a bridge restart.
+
+Let the probe and reference thermometer stabilize in the same water first.
+For example, if the probe reads `25.4 C` and your calibrated reference reads
+`25.9 C`, enter **25.9**, not `0.5`.
+
+The bridge fetches fresh telemetry and configuration, then limits the correction
+to **+/-2 C per operation**. This is the requested bridge safety guard, not a
+claimed firmware limit or cumulative-offset limit. It sends only
+`{"offset": delta, "last_adjustment_date": UTC_Unix_seconds}` to `/offset`.
+It reads configuration back and checks the expected accumulated offset, matching
+timestamp, unchanged factory/pH fields, and unchanged compensation lag. A matching
+reference is a no-op and does not wear flash with another write.
+
+Both aquarium measurement topics remain offline during the change and for at
+least the greater of `calibration_settle_seconds` and the firmware's
+`mtc_temp_lag_sec`. The firmware lag must fit the configured
+`calibration_timeout` verification window. A fresh healthy sample is required
+before measurements resume; no cached or host-adjusted temperature is substituted.
+Calibration status and the offset diagnostic remain visible while readings are
+inhibited.
+
+The discovered control generates the existing protected MQTT command envelope:
+`action: "temperature_reference"`, numeric `reference_c`, explicit `confirm: true`,
+current boot/nonce tokens, unique command ID, and short expiry. No `session_id`
+is supplied because adjustment is allowed only from idle monitoring. Home
+Assistant and Pico clocks must be synchronized. Nonce changes refresh discovery
+so the control does not depend on guessed HA entity IDs.
+
+Retained, duplicate, expired, stale-token, and conflicting-session commands cannot
+repeat an additive write. If acknowledgement or read-back is lost, the bridge
+**does not retry `/offset`**: it retains the recovery marker and publishes failure
+diagnostics. Inspect the retained `/config` response and failure before explicit
+recovery/confirmation; do not blindly repeat the reference command or delete the
+marker. The temperature-calibration feature reads configuration on connection but never writes
+merely because the bridge or Home Assistant restarted.
+
+Set `temperature_calibration_enabled=False` to forbid the firmware write again.
+As with other discovery settings, old retained entity configurations are not
+deleted automatically; remove the two corresponding discovery configs if the
+controls should disappear.
 
 ### Availability and stale readings
 
@@ -793,8 +891,8 @@ Every command needs:
 - `command_id`: a unique 1-64 character string for this action.
 - `expires_at`: **integer UTC Unix seconds**, normally current time + 60.
   It must be in the future and no more than 120 seconds ahead.
-- `session_id`: from state for every command except `start`.
-- `confirm: true`: for buffer placement, cancel, recovery and return.
+- `session_id`: from state except for idle `start` and `temperature_reference`.
+- `confirm: true`: for buffer placement, cancel, recovery, return and temperature adjustment.
 
 Status is refreshed approximately every 30 seconds while connected (bounded
 in-flight BLE/network operations can delay it). Wait for the
@@ -1067,8 +1165,9 @@ Shared configurable limits:
 The Pico keeps existing success/error indications and supports calibration/
 waiting LED cues through its runtime; the MQTT state remains authoritative.
 During hardware testing, keep Thonny logs visible. No firmware reset, factory
-calibration reset, arbitrary BLE endpoint, or temperature-calibration command is
-exposed over MQTT.
+calibration reset, or arbitrary BLE endpoint is exposed over MQTT. User
+temperature-offset writes require the separately controlled temperature feature
+and a confirmed manual command; factory-temperature offset writes remain forbidden.
 
 ### Optional Home Assistant control surface
 
@@ -1198,9 +1297,14 @@ The reset is not exposed over MQTT and never clears a bridge safety marker.
 Run the application/driver tests as well:
 
 ```bash
+.venv/bin/python -m pip install -r requirements-test.txt
 .venv/bin/python -B -m unittest -v test_reef_mqtt test_reef_probe \
-  test_reef_calibration test_reef_mqtt_linux_commands
+  test_reef_calibration test_reef_mqtt_linux_commands test_reef_temperature
 ```
+
+`requirements-test.txt` adds a test-only Jinja2 renderer so discovery command
+templates are rendered and fed into the real calibration controller, not just
+checked as strings. It is not a Pico or bridge runtime dependency.
 
 These tests use synthetic packets and mocked BLE/MQTT devices. They never scan,
 connect, or calibrate real hardware; synthetic sample values only exist in tests
@@ -1228,6 +1332,11 @@ interlocks, including the actual shared application through the mocked Pico driv
 Discovery tests verify all eight entities share one device, enabled/disabled
 configuration on Linux and Pico, sensor units/templates/expiry, calibration-status
 visibility, and bounded diagnostic summaries even when full responses are chunked.
+Temperature-calibration tests cover positive/negative corrections, the exact
+2-degree boundary and rejection beyond it, explicit opt-in and confirmation,
+factory/pH-field preservation, timestamp/read-back failures, lost acknowledgements,
+duplicate/replayed commands, compensation settling, device-offset reads after
+restart, and the discovered number control through scripted Pico MQTT/BLE.
 Validation for the MQTT calibration implementation: **244 offline tests passed**
 (158 shared/Linux/diagnostic tests and 86 Pico tests), including the actual shared
 calibration controller driven through the mocked Pico MQTT/BLE transport.
@@ -1252,6 +1361,9 @@ The shared settings are accepted on Linux, but its adapter does not drive GPIO.
 - [Calibration point payload](unpacked/apktool/com.hippotec.redsea/smali/U0/f$a.smali)
 - [Calibration argument construction](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/activities/devices/control/calibration/base/BaseControlProbeCalibrationActivity.smali)
 - [Calibration state names](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/model/control/ControlProbeCalibrationStatus$Companion.smali)
+- [Temperature reference-entry flow](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/activities/devices/control/settings/ControlProbeTempAdjustmentActivity.smali)
+- [Reference-minus-reading calculation](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/activities/devices/control/settings/ControlProbeTempAdjustmentActivity$f.smali)
+- [BLE user-offset payload fields](unpacked/apktool/com.hippotec.redsea/smali/com/blesdk/impl/protocol/commands/models/OffsetResponseModel$a.smali)
 - [ReefSense firmware cloud flow](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/app_services/Fota/firmwaredownload/FirmwareFromCloudDownloadAppService.smali)
 - [Probe firmware update activity](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/activities/settings/SensorFirmwareUpdateActivity.smali)
 - [BLE firmware update orchestration](unpacked/apktool/com.hippotec.redsea/smali_classes2/com/hippotec/redsea/managers/BleFirmwareUpdateManager.smali)

@@ -89,7 +89,7 @@ class MqttPublisher:
 
     def _command_topics(self) -> list[str]:
         topics = [self.settings.read_command_topic]
-        if self.settings.calibration_enabled:
+        if self.settings.calibration_enabled or self.settings.temperature_calibration_enabled:
             topics.append(self.settings.calibration_command_topic)
         return topics
 
@@ -325,6 +325,7 @@ class Runtime:
         self.probe = Probe(
             self.client, LoggingTrace(), self.settings.request_timeout,
             self.settings.calibration_enabled,
+            allow_temperature_calibration=self.settings.temperature_calibration_enabled,
         )
         await self.client.connect()
         await self.probe.start()
@@ -413,7 +414,9 @@ class Runtime:
 
 
 async def run(settings: Settings, *, dry_run: bool, once: bool, check_broker: bool) -> None:
-    if settings.calibration_enabled and (dry_run or once or check_broker):
+    if (settings.calibration_enabled or settings.temperature_calibration_enabled) and (
+        dry_run or once or check_broker
+    ):
         raise ValueError("Calibration cannot be enabled with --dry-run, --check-broker or --once")
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -446,12 +449,18 @@ def main(argv: list[str] | None = None) -> int:
         "--enable-calibration", action="store_true",
         help="opt in to MQTT calibration commands; incompatible with dry-run, check-broker and once",
     )
+    parser.add_argument(
+        "--enable-temperature-calibration", action="store_true",
+        help="opt in to firmware temperature correction; incompatible with dry-run, check-broker and once",
+    )
     parser.add_argument("--interval", type=float, default=POLL_INTERVAL_SECONDS, help="poll period in seconds")
     parser.add_argument("--no-discovery", action="store_true", help="do not publish Home Assistant discovery")
     parser.add_argument("--debug", action="store_true", help="include raw BLE traffic in logs")
     args = parser.parse_args(argv)
     if args.enable_calibration and (args.dry_run or args.check_broker or args.once):
         parser.error("--enable-calibration cannot be combined with --dry-run, --check-broker or --once")
+    if args.enable_temperature_calibration and (args.dry_run or args.check_broker or args.once):
+        parser.error("--enable-temperature-calibration cannot be combined with --dry-run, --check-broker or --once")
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -461,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
             password=os.environ.get("MQTT_PASSWORD", ""),
             client_id="reef-probe-" + socket.gethostname(),
             calibration_enabled=args.enable_calibration,
+            temperature_calibration_enabled=args.enable_temperature_calibration,
             discovery_enabled=not args.no_discovery,
         )
         settings.validate(require_credentials=not args.dry_run)

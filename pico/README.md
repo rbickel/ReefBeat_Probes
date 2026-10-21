@@ -51,19 +51,24 @@ Optional `OVERRIDES` uses **canonical lower-case Settings field names**, such as
 `mqtt_timeout`, `retry_min`, `retry_max`, `ntp_host`, `ph_topic`,
 `temperature_topic`, `availability_topic`, `temperature_sensor`, `wifi_timeout`,
 `wifi_disable_power_save`, `wifi_country`, `status_led`, `read_command_topic`,
-`discovery_enabled`, and `discovery_prefix`.
-Defaults live in the root module, not a duplicate Pico configuration class.
+`discovery_enabled`, `discovery_prefix`, and `temperature_calibration_enabled`.
+Most defaults live in the root module, not a duplicate Pico configuration class.
+The Pico entrypoint enables `temperature_calibration_enabled` by default while
+respecting an explicit override; Linux keeps temperature calibration opt-in.
 The example uses the shared ten-second `mqtt_timeout`. An older board config
 may still override it with three seconds; changing the example on the computer
 does not update the board. Ten seconds allows more network latency, but cannot
 fix an unreliable WiFi link or unreachable broker.
 
-### Calibration is disabled unless explicitly enabled
+### pH calibration remains opt-in
 
-Keep `calibration_enabled=False` for ordinary telemetry. Only an explicit
-`OVERRIDES["calibration_enabled"] = True` permits the adapter to subscribe to
-`calibration_command_topic` at QoS 1 and send calibration POSTs. It subscribes to
-the exact topic, never a wildcard. The independent read-only command subscription
+Only an explicit
+`OVERRIDES["calibration_enabled"] = True` permits pH calibration POSTs.
+The temperature-calibration control is enabled by default, but writes the user
+temperature offset only after a confirmed manual request. It never authorizes pH
+or factory calibration. Set `temperature_calibration_enabled=False` to disable it.
+Either enabled feature adds `calibration_command_topic` at QoS 1, always the exact topic,
+never a wildcard. The independent read-only command subscription
 is always available and does not enable calibration. The defaults are:
 
 | Setting | Default |
@@ -73,6 +78,7 @@ is always available and does not enable calibration. The defaults are:
 | `calibration_event_topic` | `reef/sump_ph/calibration/event` |
 | `calibration_failure_topic` | `reef/sump_ph/calibration/failure` |
 | `probe_diagnostics_topic` | `reef/reef_probe/diagnostics` |
+| `temperature_calibration_enabled` | `True` |
 | `calibration_timeout` | 420 seconds |
 | `calibration_wait_timeout` | 900 seconds |
 | `calibration_poll_interval` | 3 seconds |
@@ -115,8 +121,11 @@ Discovery is **enabled by default**. With Home Assistant MQTT discovery enabled,
 continuous mode creates one **ReefSense probe** device containing pH, temperature,
 Read now, pH voltage, temperature voltage, probe status, last-reading timestamp,
 and calibration status. The last five sensors are categorized as diagnostics.
-Calibration status shows `disabled` until calibration is explicitly enabled;
-discovery itself never enables calibration or sends calibration POSTs.
+**Calibrate temperature** and **Temperature offset** are also included by default,
+giving ten entities on the same device. Setting
+`temperature_calibration_enabled=False` leaves the eight base entities.
+Calibration status shows `disabled` only when both calibration features are off;
+discovery itself never sends calibration POSTs.
 
 Merge this into the board's existing `config.py` `OVERRIDES`, retaining other
 overrides and credentials:
@@ -150,8 +159,8 @@ values without waiting for the next 60-second poll. The Pico services requests d
 probe's BLE response time is additional. Normal polling continues afterward.
 
 The default `read_command_topic` is `reef/reef_probe/read/command`. Commands use
-the exact payload `READ`, QoS 1, and **retain=false**. Calibration remains disabled
-unless explicitly enabled; manual reads cannot bypass calibration/recovery or
+The exact payload `READ`, QoS 1, and **retain=false**. Calibration starts only
+after a manual request; manual reads cannot bypass calibration/recovery or
 settling interlocks. Retained replays and invalid read payloads are logged and
 ignored.
 
@@ -159,6 +168,43 @@ Update the board-root copies of [../reef_mqtt.py](../reef_mqtt.py),
 [pico_runtime.py](pico_runtime.py), and [pico_mqtt.py](pico_mqtt.py) together and
 restart the MicroPython backend, preserving `config.py` and credentials.
 See [Home Assistant setup and broker permissions](../README.md#automatic-home-assistant-discovery).
+
+### Firmware temperature calibration
+
+The control is **enabled by default**. To match a calibrated reference thermometer,
+update the board-root copies of
+[../reef_mqtt.py](../reef_mqtt.py),
+[../reef_calibration.py](../reef_calibration.py),
+[../reef_probe_protocol.py](../reef_probe_protocol.py), and
+[pico_runtime.py](pico_runtime.py). To disable the control in local `config.py`:
+
+```python
+OVERRIDES["temperature_calibration_enabled"] = False
+```
+
+An existing explicit `False` remains respected; change it to `True` to enable
+the control. Keep other overrides and credentials and restart the MicroPython backend.
+With discovery enabled, edit **Calibrate temperature** in the device's
+**Configuration** section. Enter your reference thermometer's actual temperature,
+not a delta; the field displays the current probe reading. For `25.4 C` on the
+probe and `25.9 C` on the reference, enter `25.9`. Allow both probes to stabilize
+in the same water before adjusting.
+
+This sends the probe firmware's additive **user** `/offset` operation after fresh
+reads, with a **+/-2 C maximum correction per operation**. It verifies offset,
+timestamp, and unchanged factory/pH coefficients, then waits for temperature
+compensation to settle before publishing fresh aquarium readings. No display-only
+offset is added on the Pico. **Temperature offset** shows the stored firmware
+value; it is read on connection, never applied again automatically.
+
+The write needs current boot/nonce/expiry/confirmation metadata, generated by the
+discovered control. A lost or ambiguous response leaves the persistent recovery
+marker; the additive write is never automatically repeated. pH calibration
+remains disabled unless separately enabled. Factory offset/reset endpoints stay
+forbidden. No firmware temperature calibration or physical accuracy verification
+was performed during development.
+
+See [full protocol, safety, and recovery details](../README.md#firmware-temperature-calibration).
 
 ## Copy and install on the board
 
@@ -455,6 +501,7 @@ Verified **2026-09-27** against micropython-lib commit
 From the workspace root:
 
 ```sh
+.venv/bin/python -m pip install -r requirements-test.txt
 .venv/bin/python -B -m unittest discover -s pico/tests -p 'test_*.py' -v
 .venv/bin/python -m compileall -q pico
 ```
@@ -478,6 +525,9 @@ also runs the actual shared calibration loop from start through mid-point
 progress, rejects retained commands, and verifies aquarium-state suppression,
 with mocked radio, socket and marker storage. `compileall` is CPython syntax validation,
 not a claim of MicroPython execution.
+The temperature integration test renders the auto-discovered command template,
+delivers it over the scripted MQTT subscription, verifies the sole BLE
+`/offset` write, and confirms fresh publication only after compensation settling.
 
 Validation on 2026-09-27: **86 offline tests passed**, and actual
 **mpy-cross v1.29.0** successfully compiled `pico_runtime.py`, `pico_mqtt.py`,

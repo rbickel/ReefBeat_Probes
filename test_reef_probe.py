@@ -288,6 +288,51 @@ class ExchangeTests(unittest.IsolatedAsyncioTestCase):
             await probe.request("/factory-reset", method=rp.POST)
         probe.client.write_gatt_char.assert_not_awaited()
 
+    async def test_temperature_write_has_a_separate_opt_in_and_exact_wire_payload(self):
+        original = make_probe()
+        probe = rp.Probe(
+            original.client, original.trace, 0.1, False, allow_temperature_calibration=True,
+        )
+        probe.mtu = 512
+
+        async def acknowledge(*args, **kwargs):
+            await probe.queue.put(packet(b'\xc8\x00{"success":true}\0'))
+
+        probe.client.write_gatt_char.side_effect = acknowledge
+        payload = {"offset": -0.3, "last_adjustment_date": 1800000000}
+        self.assertEqual(await probe.request("/offset", payload, method=rp.POST), {"success": True})
+        self.assertFalse(probe.allow_calibration)
+        raw = b"".join(call.args[1][5:] for call in probe.client.write_gatt_char.await_args_list)
+        method, body = raw[0], raw[1:]
+        path, encoded = body.split(b"\0", 1)
+        self.assertEqual((method, path), (rp.POST, b"/offset"))
+        self.assertEqual(json.loads(encoded[:-1]), payload)
+
+    async def test_temperature_opt_in_never_allows_factory_or_ph_writes(self):
+        original = make_probe()
+        probe = rp.Probe(
+            original.client, original.trace, 0.1, False, allow_temperature_calibration=True,
+        )
+        for path in ("/factory-offset", "/config", "/calibration-enter",
+                     "/calibration-point-start", "/calibration-exit", "/calibration-factory-reset"):
+            with self.subTest(path=path), self.assertRaises(rp.ProbeError):
+                await probe.request(path, method=rp.POST)
+        for payload in (
+            {"offset": 2.01, "last_adjustment_date": 1800000000},
+            {"offset": 0.5, "last_adjustment_date": True},
+            {"offset": 0.5, "last_adjustment_date": 1800000000, "extra": 1},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(rp.ProbeError):
+                await probe.request("/offset", payload, method=rp.POST)
+        probe.client.write_gatt_char.assert_not_awaited()
+
+    async def test_ph_calibration_confirmation_does_not_allow_temperature_offsets(self):
+        probe = make_probe(allow_calibration=True)
+        with self.assertRaisesRegex(rp.ProbeError, "own explicit opt-in"):
+            await probe.request("/offset", {"offset": 0.5, "last_adjustment_date": 1800000000},
+                                method=rp.POST)
+        probe.client.write_gatt_char.assert_not_awaited()
+
     async def test_post_requires_explicit_success(self):
         probe = make_probe(allow_calibration=True)
 

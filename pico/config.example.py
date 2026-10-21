@@ -5,11 +5,12 @@ MQTT_USERNAME = "reefpi"
 MQTT_PASSWORD = ""
 MQTT_CLIENT_ID = "reef-probe-pico-w-unique-name"  # Change; never reuse the Pi3 ID.
 
-# Optional canonical Settings overrides; defaults live only in reef_mqtt.py.
+# Optional canonical Settings overrides; most defaults live in reef_mqtt.py.
 OVERRIDES = {
     "mqtt_timeout": 10.0,
     "discovery_enabled": True,
     "calibration_enabled": False,  # Explicit opt-in required; never enable just to test transport.
+    "temperature_calibration_enabled": True,  # Control enabled; firmware writes still require a manual request.
     # "calibration_command_topic": "reef/sump_ph/calibration/command",  # Exact topic, no wildcards.
     # "calibration_state_topic": "reef/sump_ph/calibration/state",
     # "calibration_event_topic": "reef/sump_ph/calibration/event",

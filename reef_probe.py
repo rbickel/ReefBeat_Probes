@@ -20,6 +20,7 @@ from reef_probe_protocol import (
     SERVICE_UUID, WRITE_UUID, NOTIFY_UUID, GET, POST, REST, ACK, ERROR, MAX_RESPONSE,
     ProbeError, ProbeRejected, ProbeConnectionError, request_packets, unpack_packet, Response,
     decode_response, validate_telemetry,
+    TEMPERATURE_OFFSET_PATH, validate_temperature_offset_payload,
 )
 
 if TYPE_CHECKING:
@@ -70,13 +71,14 @@ class Trace:
 class Probe:
     def __init__(
         self, client: BleakClient, trace: TraceRecorder, timeout: float, allow_calibration: bool,
-        *, allow_calibration_reset: bool = False,
+        *, allow_calibration_reset: bool = False, allow_temperature_calibration: bool = False,
     ):
         self.client = client
         self.trace = trace
         self.timeout = timeout
         self.allow_calibration = allow_calibration
         self.allow_calibration_reset = allow_calibration_reset
+        self.allow_temperature_calibration = allow_temperature_calibration
         self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
         self.disconnected = asyncio.Event()
         self.callback_error: ProbeError | OSError | None = None
@@ -168,6 +170,11 @@ class Probe:
     async def request(
         self, path: str, payload: dict[str, object] | None = None, *, method: int = GET
     ) -> dict[str, object]:
+        if path == TEMPERATURE_OFFSET_PATH:
+            if method != POST or not self.allow_temperature_calibration:
+                raise ProbeError("Temperature adjustment requires its own explicit opt-in.")
+            validate_temperature_offset_payload(payload)
+            return await self._exchange(path, payload, method=POST)
         if path == CALIBRATION_RESET_PATH:
             if not self.allow_calibration_reset or method != POST or payload is not None:
                 raise ProbeError("Factory calibration reset requires its own explicit confirmation and no payload.")

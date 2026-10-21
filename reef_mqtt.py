@@ -39,6 +39,7 @@ class Settings:
             "wifi_timeout": 60.0, "wifi_disable_power_save": True, "wifi_country": "",
             "status_led": True,
             "calibration_enabled": False,
+            "temperature_calibration_enabled": False,
             "calibration_command_topic": "reef/sump_ph/calibration/command",
             "calibration_state_topic": "reef/sump_ph/calibration/state",
             "calibration_event_topic": "reef/sump_ph/calibration/event",
@@ -73,7 +74,8 @@ class Settings:
                 raise ValueError(key + " must be finite and positive")
         if self.retry_max < self.retry_min:
             raise ValueError("retry_max must be >= retry_min")
-        for key in ("wifi_disable_power_save", "status_led", "calibration_enabled", "discovery_enabled"):
+        for key in ("wifi_disable_power_save", "status_led", "calibration_enabled",
+                    "temperature_calibration_enabled", "discovery_enabled"):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(key + " must be a boolean")
         if not isinstance(self.wifi_country, str) or (
@@ -187,6 +189,7 @@ def discovery_messages(settings):
         "payload_available": "online", "payload_not_available": "offline",
     }
     summary_topic = settings.probe_diagnostics_topic + "/summary"
+    calibration_monitoring = settings.calibration_enabled or settings.temperature_calibration_enabled
     entities = (
         ("sensor", "ph", "pH", {
             "state_topic": settings.ph_topic, "value_template": "{{ value_json.value }}",
@@ -216,8 +219,8 @@ def discovery_messages(settings):
             "device_class": "timestamp", "entity_category": "diagnostic",
         }),
         ("sensor", "calibration_status", "Calibration status", {
-            "state_topic": settings.calibration_state_topic if settings.calibration_enabled else settings.ph_topic,
-            "value_template": "{{ value_json.state }}" if settings.calibration_enabled else "{{ 'disabled' }}",
+            "state_topic": settings.calibration_state_topic if calibration_monitoring else settings.ph_topic,
+            "value_template": "{{ value_json.state }}" if calibration_monitoring else "{{ 'disabled' }}",
             "entity_category": "diagnostic", "icon": "mdi:flask",
         }),
         ("button", "read_now", "Read now", {
@@ -225,20 +228,46 @@ def discovery_messages(settings):
             "qos": 1, "retain": False, "icon": "mdi:refresh",
         }),
     )
+    if settings.temperature_calibration_enabled:
+        entities += (
+            ("number", "temperature_calibration", "Calibrate temperature", {
+                "state_topic": settings.temperature_topic, "value_template": "{{ value_json.value }}",
+                "command_topic": settings.calibration_command_topic, "qos": 1, "retain": False,
+                "unit_of_measurement": "\u00b0C", "device_class": "temperature",
+                "min": 0, "max": 99.9, "step": 0.1, "mode": "box",
+                "entity_category": "config", "icon": "mdi:thermometer-check",
+            }),
+            ("sensor", "temperature_offset", "Temperature offset", {
+                "state_topic": settings.calibration_state_topic,
+                "value_template": "{{ value_json.temperature_offset_c }}",
+                "unit_of_measurement": "\u00b0C", "entity_category": "diagnostic",
+                "icon": "mdi:thermometer",
+            }),
+        )
     for component, key, name, properties in entities:
         config = {"name": name, "unique_id": identifier + "_" + key, "device": device, "qos": 0}
         config.update(properties)
         # Aquarium availability is deliberately offline during calibration.
-        if key != "calibration_status" or not settings.calibration_enabled:
+        if key not in ("calibration_status", "temperature_offset") or not calibration_monitoring:
             config.update(availability)
         if component == "sensor":
             config["expire_after"] = max(180, int(math.ceil(settings.poll_interval * 3)))
         yield settings.discovery_prefix + "/" + component + "/" + identifier + "/" + key + "/config", config
 
 
-async def publish_discovery(settings, runtime):
+async def publish_discovery(settings, runtime, calibration=None):
     if settings.discovery_enabled:
+        if settings.temperature_calibration_enabled and calibration is None:
+            raise ValueError("Temperature calibration discovery requires a replay-protection controller.")
         for topic, config in discovery_messages(settings):
+            if topic.endswith("/temperature_calibration/config"):
+                config["command_template"] = (
+                    '{"action":"temperature_reference","boot_id":%s,"nonce":%s,'
+                    '"reference_c":{{ value | float }},"confirm":true,'
+                    '"command_id":"temp-{{ now().strftime(\'%%Y%%m%%d%%H%%M%%S%%f\') }}",'
+                    '"expires_at":{{ (as_timestamp(now()) | int) + %d }}}'
+                ) % (json.dumps(calibration.boot_id), json.dumps(calibration.nonce),
+                     int(settings.calibration_command_ttl))
             await runtime.publish(topic, json.dumps(config), retain=True)
 
 
@@ -277,6 +306,7 @@ async def calibration_loop(settings, runtime, stop, calibration, on_success=None
     """Service MQTT each second while retaining the configured measurement period."""
     poll_started = None
     read_requested = False
+    discovery_nonce = None
     await calibration.connected(runtime)
     announced = runtime.ticks()
     while not stop.is_set():
@@ -306,6 +336,12 @@ async def calibration_loop(settings, runtime, stop, calibration, on_success=None
                 await publish_sample(settings, runtime, telemetry)
         if on_success is not None:
             on_success()
+        if (
+            settings.temperature_calibration_enabled and settings.discovery_enabled
+            and discovery_nonce != calibration.nonce
+        ):
+            await publish_discovery(settings, runtime, calibration)
+            discovery_nonce = calibration.nonce
         delay = 1.0
         if not calibration.inhibits_measurements and poll_started is not None:
             delay = 0 if read_requested else min(
@@ -319,12 +355,13 @@ async def run_bridge(settings, runtime, stop, once=False):
     retry = settings.retry_min
     from reef_calibration import Calibration, PendingMarker
     marker = PendingMarker(settings.calibration_marker_path)
-    if not settings.calibration_enabled and marker.exists():
+    calibration_enabled = settings.calibration_enabled or settings.temperature_calibration_enabled
+    if not calibration_enabled and marker.exists():
         raise ValueError(
             "Unresolved calibration marker: enable calibration and recover/confirm return "
             "before publishing. Do not delete the marker to bypass recovery."
         )
-    calibration = Calibration(settings, marker) if settings.calibration_enabled else None
+    calibration = Calibration(settings, marker) if calibration_enabled else None
     if once and calibration is not None:
         raise ValueError("MQTT calibration requires continuous command processing, not --once.")
 
@@ -342,7 +379,7 @@ async def run_bridge(settings, runtime, stop, once=False):
                 await mark_offline(settings, runtime)
                 if not once:
                     stage = "publish Home Assistant discovery"
-                    await publish_discovery(settings, runtime)
+                    await publish_discovery(settings, runtime, calibration)
                 if calibration is not None and calibration.failure_pending:
                     await calibration.announce(runtime)
                 stage = "connect and subscribe BLE"

@@ -6,12 +6,20 @@ import json
 import math
 import os
 
-from reef_probe_protocol import GET, POST, ProbeError, ProbeRejected, validate_telemetry
+from reef_probe_protocol import (
+    GET, POST, ProbeError, ProbeRejected, validate_telemetry,
+    TEMPERATURE_OFFSET_PATH, MAX_TEMPERATURE_CORRECTION_C, validate_temperature_offset_payload,
+)
 from reef_mqtt_diagnostics import publish_document, state_summary
 
 COMMAND_LIMIT = 1024
 CACHE_LIMIT = 32
 POINT_VALUES = {"mid": (6.865, 7.0, 7.01), "high": (9.18, 10.0, 10.01, 10.012)}
+TEMPERATURE_PROTECTED_FIELDS = (
+    "factory_temp_offset", "ph_ref", "mv_ref", "slope_low", "slope_high",
+    "factory_ph_ref", "factory_mv_ref", "factory_slope_low", "factory_slope_high",
+    "mtc_temp_lag_sec",
+)
 
 
 def token():
@@ -92,6 +100,9 @@ class Calibration:
         self.enter_confirmed = False
         self.reconnect_started = None
         self.last_action = None
+        self.temperature_offset = None
+        self.temperature_adjustment = None
+        self.settle_seconds = settings.calibration_settle_seconds
         if self.marker.exists():
             self.session_id = new_token()
             self.state = "recovery_required"
@@ -120,6 +131,9 @@ class Calibration:
                 "timeout_seconds": self.cfg.calibration_reconnect_timeout,
             } if self.state == "reconnecting" else None,
         }
+        if self.cfg.temperature_calibration_enabled:
+            result["temperature_offset_c"] = self.temperature_offset
+            result["temperature_adjustment"] = self.temperature_adjustment
         if len(json.dumps(result).encode("utf-8")) > 3072:
             result["progress"] = {"details_topic": self.response_topic("/calibration-status")}
             result["last_failure"] = {"details_topic": self.cfg.calibration_failure_topic}
@@ -186,6 +200,8 @@ class Calibration:
                 "request_timeout": self.cfg.request_timeout, "mqtt_timeout": self.cfg.mqtt_timeout,
             },
         }
+        if self.cfg.temperature_calibration_enabled:
+            self.last_failure["temperature_adjustment"] = self.temperature_adjustment
         diagnostic_context = getattr(runtime, "diagnostic_context", None)
         if diagnostic_context is not None:
             self.last_failure["transport"] = diagnostic_context()
@@ -391,6 +407,10 @@ class Calibration:
     async def connected(self, runtime):
         if self.inhibits_measurements:
             await runtime.publish(self.cfg.availability_topic, "offline")
+        if self.cfg.temperature_calibration_enabled:
+            config = await self._request(runtime, "/config")
+            self.temperature_offset = self._temperature_configuration(config)
+            self.settle_seconds = max(self.cfg.calibration_settle_seconds, config["mtc_temp_lag_sec"])
         if self.state == "reconnecting":
             await self._verify_reconnect(runtime)
         await self.announce(runtime)
@@ -429,11 +449,28 @@ class Calibration:
         extras = {
             "start": set(), "point_ready": {"point", "solution_ph", "solution_rated_temp", "confirm"},
             "cancel": {"confirm"}, "recover": {"confirm"}, "returned": {"confirm"},
+            "temperature_reference": {"reference_c", "confirm"},
         }
         if action not in extras or set(data) - common - extras[action]:
             raise CommandError("Unknown action or fields.")
         if data["nonce"] != self.nonce:
             raise CommandError("Stale nonce; fetch current calibration state.")
+        if action == "temperature_reference":
+            if not self.cfg.temperature_calibration_enabled:
+                raise CommandError("Firmware temperature calibration is not enabled.")
+            if self.state != "idle" or data.get("session_id") is not None:
+                raise CommandError("Temperature adjustment requires idle monitoring with no active session.")
+            if data.get("confirm") is not True:
+                raise CommandError("Explicit confirm=true is required.")
+            reference = data.get("reference_c")
+            if (
+                isinstance(reference, bool) or not isinstance(reference, (int, float))
+                or not math.isfinite(reference) or not 0 <= reference <= 99.9
+            ):
+                raise CommandError("Reference temperature must be a finite number from 0 to 99.9 C.")
+            return
+        if action in ("start", "point_ready", "cancel") and not self.cfg.calibration_enabled:
+            raise CommandError("pH calibration is not enabled.")
         if action == "start":
             if self.state != "idle" or data.get("session_id") is not None:
                 raise CommandError("A session already exists; cannot start another.")
@@ -490,6 +527,11 @@ class Calibration:
         self.nonce = self.new_token()
         try:
             await self._act(runtime, data)
+        except CommandError as exc:
+            entry[1] = "rejected"
+            await self.announce(runtime)
+            await self.event(runtime, "rejected", data["command_id"], str(exc))
+            return
         except runtime.errors as exc:
             entry[1] = "failed_or_uncertain"
             if self.inhibits_measurements:
@@ -502,7 +544,9 @@ class Calibration:
 
     async def _act(self, runtime, data):
         action = data["action"]
-        if action == "start":
+        if action == "temperature_reference":
+            await self._temperature_reference(runtime, data)
+        elif action == "start":
             # Set the in-memory guard even if disk I/O fails part way through.
             self.state = "recovery_required"
             self.checkpoint = None
@@ -515,9 +559,14 @@ class Calibration:
             self.completed_points = []
             self.point = self.point_started = self.point_requested_at = None
             self.buffer_parameters = None
+            self.completed_points = []
+            self.progress = self.last_status = None
+            self.outcome = None
             self.last_status = None
             self.last_telemetry = None
             self.outcome = None
+            self.temperature_adjustment = None
+            self.settle_seconds = self.cfg.calibration_settle_seconds
             await runtime.publish(self.cfg.availability_topic, "offline")
             telemetry = await self._request(runtime, "/telemetry")
             validate_telemetry(telemetry)
@@ -574,6 +623,73 @@ class Calibration:
         elif action == "returned":
             self.outcome = self.outcome or "returned"
             await self._set_state(runtime, "settling", "Return confirmed; waiting before aquarium measurements resume.")
+
+    def _temperature_configuration(self, config):
+        for key in ("temp_offset",) + TEMPERATURE_PROTECTED_FIELDS:
+            value = config.get(key)
+            if (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ProbeError("Unsupported temperature configuration: invalid " + key, config)
+        timestamp = config.get("temp_last_adjustment_date")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+            raise ProbeError("Unsupported temperature adjustment timestamp.", config)
+        if not 0 <= config["mtc_temp_lag_sec"] <= self.cfg.calibration_timeout:
+            raise ProbeError("Probe temperature-compensation lag exceeds the supported settling window.", config)
+        return config["temp_offset"]
+
+    async def _temperature_reference(self, runtime, data):
+        telemetry = await self._request(runtime, "/telemetry")
+        validate_telemetry(telemetry)
+        if str(telemetry.get("status", "")).lower() != "connected":
+            raise ProbeError("Temperature adjustment requires healthy normal probe telemetry.", telemetry)
+        before = await self._request(runtime, "/config")
+        previous = self._temperature_configuration(before)
+        self.temperature_offset = previous
+        delta = data["reference_c"] - telemetry["temperature_value"]
+        if abs(delta) > MAX_TEMPERATURE_CORRECTION_C:
+            raise CommandError("Reference differs from the fresh probe reading by more than 2 C.")
+        if delta == 0:
+            self.outcome = "temperature_unchanged"
+            await self.event(runtime, "temperature_unchanged", data["command_id"],
+                             "Reference already matches the probe; no firmware write.")
+            return
+        expected = previous + delta
+        if not math.isfinite(expected):
+            raise ProbeError("Calculated firmware temperature offset is not finite.")
+        payload = {"offset": delta, "last_adjustment_date": runtime.epoch()}
+        validate_temperature_offset_payload(payload)
+        self.temperature_adjustment = {
+            "reference_c": data["reference_c"], "measured_c": telemetry["temperature_value"],
+            "previous_offset_c": previous, "delta_c": delta, "expected_offset_c": expected,
+            "last_adjustment_date": payload["last_adjustment_date"],
+        }
+        self.state = "adjusting_temperature"
+        self.detail = "Writing and verifying the probe's user temperature offset."
+        self.session_id = self.new_token()
+        self.point = self.point_started = self.point_requested_at = None
+        self.buffer_parameters = None
+        self.enter_attempted = self.enter_confirmed = False
+        self.checkpoint = self.pending_write = None
+        self.settle_seconds = max(self.cfg.calibration_settle_seconds, before["mtc_temp_lag_sec"])
+        self.marker.set()
+        await runtime.publish(self.cfg.availability_topic, "offline")
+        await self.announce(runtime)
+        await self._post(runtime, TEMPERATURE_OFFSET_PATH, payload)
+        after = await self._request(runtime, "/config")
+        self.temperature_offset = self._temperature_configuration(after)
+        if abs(self.temperature_offset - expected) > 0.0001:
+            raise ProbeError("Firmware temperature offset did not match the expected read-back.", after)
+        if after["temp_last_adjustment_date"] != payload["last_adjustment_date"]:
+            raise ProbeError("Firmware temperature adjustment timestamp did not match read-back.", after)
+        for key in TEMPERATURE_PROTECTED_FIELDS:
+            if after[key] != before[key]:
+                raise ProbeError("Protected probe configuration changed: %s (%s -> %s)" %
+                                 (key, before[key], after[key]), after)
+        self.outcome = "temperature_adjusted"
+        await self._set_state(runtime, "settling",
+                              "Firmware offset verified; waiting for temperature compensation to settle.")
 
     async def _post(self, runtime, path, payload=None):
         self.pending_write = path
@@ -633,7 +749,7 @@ class Calibration:
                 await self._recovery(runtime, "Operator wait expired. Recovery and placement confirmation required.",
                                      kind="operator_timeout")
         elif self.state == "settling":
-            if runtime.elapsed(self.wait_started) < self.cfg.calibration_settle_seconds:
+            if runtime.elapsed(self.wait_started) < self.settle_seconds:
                 return
             telemetry = await self._request(runtime, "/telemetry")
             validate_telemetry(telemetry)
@@ -641,7 +757,10 @@ class Calibration:
                 raise ProbeError("Probe is not in normal measurement state after return.")
             self.checkpoint = None
             self.marker.clear()
-            await self._set_state(runtime, "idle", "Monitoring resumed after explicit return and settle.")
+            detail = ("Monitoring resumed after verified firmware temperature adjustment and settle."
+                      if self.outcome == "temperature_adjusted"
+                      else "Monitoring resumed after explicit return and settle.")
+            await self._set_state(runtime, "idle", detail)
             await self.event(runtime, "monitoring_resumed", self.last_command_id)
             self.session_id = None
             await self.announce(runtime)
