@@ -7,6 +7,7 @@ import sys
 
 from reef_mqtt_payload import state_messages, validate_topics
 from reef_mqtt_diagnostics import publish_document
+from reef_probe_protocol import validate_telemetry
 
 # Shared installation defaults. Credentials are loaded by the platform adapter.
 POLL_INTERVAL_SECONDS = 60.0
@@ -30,7 +31,8 @@ class Settings:
             "temperature_topic": TEMPERATURE_TOPIC,
             "temperature_sensor": TEMPERATURE_SENSOR_LABEL,
             "availability_topic": AVAILABILITY_TOPIC, "qos": MQTT_QOS,
-            "read_command_topic": READ_COMMAND_TOPIC, "discovery_prefix": "homeassistant",
+            "read_command_topic": READ_COMMAND_TOPIC,
+            "discovery_enabled": True, "discovery_prefix": "homeassistant",
             "scan_timeout": 15.0, "request_timeout": 15.0, "mqtt_timeout": 10.0,
             "retry_min": 5.0, "retry_max": 60.0,
             "wifi_ssid": "", "wifi_password": "", "ntp_host": "pool.ntp.org",
@@ -71,7 +73,7 @@ class Settings:
                 raise ValueError(key + " must be finite and positive")
         if self.retry_max < self.retry_min:
             raise ValueError("retry_max must be >= retry_min")
-        for key in ("wifi_disable_power_save", "status_led", "calibration_enabled"):
+        for key in ("wifi_disable_power_save", "status_led", "calibration_enabled", "discovery_enabled"):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(key + " must be a boolean")
         if not isinstance(self.wifi_country, str) or (
@@ -107,7 +109,7 @@ class Settings:
                 raise ValueError("Invalid " + key)
             if key != "discovery_prefix":
                 topics.append(topic)
-        topics.append(read_button_discovery(self)[0])
+        topics.extend(topic for topic, _config in discovery_messages(self))
         if len(set(topics)) != len(topics):
             raise ValueError("Command, discovery, calibration, measurement and availability topics must be distinct")
         diagnostic_roots = (self.probe_diagnostics_topic, self.calibration_failure_topic,
@@ -136,12 +138,17 @@ async def indicate(runtime, event):
 
 
 async def publish_sample(settings, runtime, telemetry):
+    validate_telemetry(telemetry)
     messages = state_messages(
         telemetry, runtime.timestamp(), settings.ph_topic,
         settings.temperature_topic, settings.temperature_sensor,
     )
     for topic, payload in messages:
         await runtime.publish(topic, json.dumps(payload))
+    await runtime.publish(settings.probe_diagnostics_topic + "/summary", json.dumps({
+        "ts": messages[0][1]["ts"], "status": telemetry["status"],
+        "mv": telemetry["mv"], "temperature_mv": telemetry["temperature_mv"],
+    }))
     await publish_document(runtime, settings.probe_diagnostics_topic + "/telemetry", {
         "ts": messages[0][1]["ts"], "method": "GET", "path": "/telemetry",
         "state": "idle", "response": telemetry,
@@ -169,24 +176,70 @@ async def close_runtime(runtime):
         runtime.report("error", "Transport cleanup failed: %s" % describe_error(exc))
 
 
-def read_button_discovery(settings):
+def discovery_messages(settings):
     identifier = "reef_probe_" + settings.address.lower().replace(":", "").replace("-", "")
-    return settings.discovery_prefix + "/button/" + identifier + "/read_now/config", {
-        "name": "Read now", "unique_id": identifier + "_read_now",
-        "command_topic": settings.read_command_topic, "payload_press": "READ",
-        "qos": 1, "retain": False, "icon": "mdi:refresh",
+    device = {
+        "identifiers": [identifier], "name": "ReefSense probe",
+        "manufacturer": "Red Sea", "model": "ReefSense pH",
+    }
+    availability = {
         "availability_topic": settings.availability_topic,
         "payload_available": "online", "payload_not_available": "offline",
-        "device": {
-            "identifiers": [identifier], "name": "ReefSense probe",
-            "manufacturer": "Red Sea", "model": "ReefSense pH",
-        },
     }
+    summary_topic = settings.probe_diagnostics_topic + "/summary"
+    entities = (
+        ("sensor", "ph", "pH", {
+            "state_topic": settings.ph_topic, "value_template": "{{ value_json.value }}",
+            "unit_of_measurement": "pH", "state_class": "measurement", "icon": "mdi:ph",
+        }),
+        ("sensor", "temperature", "Temperature", {
+            "state_topic": settings.temperature_topic, "value_template": "{{ value_json.value }}",
+            "device_class": "temperature", "unit_of_measurement": "\u00b0C",
+            "state_class": "measurement",
+        }),
+        ("sensor", "ph_voltage", "pH voltage", {
+            "state_topic": summary_topic, "value_template": "{{ value_json.mv }}",
+            "device_class": "voltage", "unit_of_measurement": "mV",
+            "state_class": "measurement", "entity_category": "diagnostic",
+        }),
+        ("sensor", "temperature_voltage", "Temperature voltage", {
+            "state_topic": summary_topic, "value_template": "{{ value_json.temperature_mv }}",
+            "device_class": "voltage", "unit_of_measurement": "mV",
+            "state_class": "measurement", "entity_category": "diagnostic",
+        }),
+        ("sensor", "probe_status", "Probe status", {
+            "state_topic": summary_topic, "value_template": "{{ value_json.status }}",
+            "entity_category": "diagnostic",
+        }),
+        ("sensor", "last_reading", "Last reading", {
+            "state_topic": settings.ph_topic, "value_template": "{{ value_json.ts }}",
+            "device_class": "timestamp", "entity_category": "diagnostic",
+        }),
+        ("sensor", "calibration_status", "Calibration status", {
+            "state_topic": settings.calibration_state_topic if settings.calibration_enabled else settings.ph_topic,
+            "value_template": "{{ value_json.state }}" if settings.calibration_enabled else "{{ 'disabled' }}",
+            "entity_category": "diagnostic", "icon": "mdi:flask",
+        }),
+        ("button", "read_now", "Read now", {
+            "command_topic": settings.read_command_topic, "payload_press": "READ",
+            "qos": 1, "retain": False, "icon": "mdi:refresh",
+        }),
+    )
+    for component, key, name, properties in entities:
+        config = {"name": name, "unique_id": identifier + "_" + key, "device": device, "qos": 0}
+        config.update(properties)
+        # Aquarium availability is deliberately offline during calibration.
+        if key != "calibration_status" or not settings.calibration_enabled:
+            config.update(availability)
+        if component == "sensor":
+            config["expire_after"] = max(180, int(math.ceil(settings.poll_interval * 3)))
+        yield settings.discovery_prefix + "/" + component + "/" + identifier + "/" + key + "/config", config
 
 
-async def publish_read_button(settings, runtime):
-    topic, config = read_button_discovery(settings)
-    await runtime.publish(topic, json.dumps(config), retain=True)
+async def publish_discovery(settings, runtime):
+    if settings.discovery_enabled:
+        for topic, config in discovery_messages(settings):
+            await runtime.publish(topic, json.dumps(config), retain=True)
 
 
 async def handle_commands(settings, runtime, calibration=None):
@@ -288,8 +341,8 @@ async def run_bridge(settings, runtime, stop, once=False):
                 await runtime.prepare()
                 await mark_offline(settings, runtime)
                 if not once:
-                    stage = "publish reading button discovery"
-                    await publish_read_button(settings, runtime)
+                    stage = "publish Home Assistant discovery"
+                    await publish_discovery(settings, runtime)
                 if calibration is not None and calibration.failure_pending:
                     await calibration.announce(runtime)
                 stage = "connect and subscribe BLE"

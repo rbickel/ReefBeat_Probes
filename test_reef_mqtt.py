@@ -151,14 +151,17 @@ class MqttTests(unittest.TestCase):
         calls = self.client.publish.call_args_list
         self.assertEqual([c.args[0] for c in calls],
                          [bridge.PH_TOPIC, bridge.TEMPERATURE_TOPIC,
+                          self.settings.probe_diagnostics_topic + "/summary",
                           self.settings.probe_diagnostics_topic + "/telemetry", bridge.AVAILABILITY_TOPIC])
         for call in calls:
             self.assertEqual(call.kwargs, {"qos": 0, "retain": True})
         self.assertEqual(json.loads(calls[0].args[1]), state_messages(SAMPLE, STAMP)[0][1])
         self.assertEqual(json.loads(calls[1].args[1])["unit"], "\u00b0C")
-        self.assertEqual(json.loads(calls[2].args[1])["response"], SAMPLE)
-        self.assertEqual(calls[3].args[1], "online")
-        self.assertEqual(self.info.wait_for_publish.call_count, 4)
+        self.assertEqual(json.loads(calls[2].args[1]),
+                         {"ts": STAMP, "status": "connected", "mv": 11, "temperature_mv": 1590})
+        self.assertEqual(json.loads(calls[3].args[1])["response"], SAMPLE)
+        self.assertEqual(calls[4].args[1], "online")
+        self.assertEqual(self.info.wait_for_publish.call_count, 5)
 
     def test_failure_does_not_announce_online(self):
         self.publisher.connect()
@@ -346,6 +349,16 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_discovery_is_enabled_by_default_with_an_explicit_opt_out(self):
+        for args, enabled in (([], True), (["--no-discovery"], False)):
+            with (
+                self.subTest(args=args),
+                patch.dict(os.environ, {"MQTT_USERNAME": "test", "MQTT_PASSWORD": "unused"}, clear=True),
+                patch("reef_mqtt_linux.run", new_callable=AsyncMock) as run,
+            ):
+                self.assertEqual(bridge.main(args), 0)
+                self.assertIs(run.call_args.args[0].discovery_enabled, enabled)
+
     def test_dry_run_needs_no_credentials_or_mqtt(self):
         with patch.dict(os.environ, {}, clear=True):
             with patch("reef_mqtt_linux.run", new_callable=AsyncMock) as run:
@@ -393,14 +406,17 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         calls = runtime.publish.await_args_list
         self.assertEqual([call.args[0] for call in calls], [
             app.AVAILABILITY_TOPIC, app.PH_TOPIC, app.TEMPERATURE_TOPIC,
+            app.Settings().probe_diagnostics_topic + "/summary",
             app.Settings().probe_diagnostics_topic + "/telemetry",
             app.AVAILABILITY_TOPIC, app.AVAILABILITY_TOPIC,
         ])
         self.assertEqual(json.loads(calls[1].args[1])["value"], SAMPLE["value"])
         self.assertEqual(json.loads(calls[2].args[1])["value"], SAMPLE["temperature_value"])
         self.assertEqual(json.loads(calls[2].args[1])["sensor"], "redsea_ph")
-        self.assertEqual(json.loads(calls[3].args[1])["response"], SAMPLE)
-        self.assertEqual([calls[i].args[1] for i in (0, 4, 5)], ["offline", "online", "offline"])
+        self.assertEqual(json.loads(calls[3].args[1]),
+                         {"ts": STAMP, "status": "connected", "mv": 11, "temperature_mv": 1590})
+        self.assertEqual(json.loads(calls[4].args[1])["response"], SAMPLE)
+        self.assertEqual([calls[i].args[1] for i in (0, 5, 6)], ["offline", "online", "offline"])
         runtime.close.assert_awaited_once()
         runtime.read.assert_awaited_once()
         self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],
@@ -413,36 +429,141 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         await app.run_bridge(app.Settings(poll_interval=60), runtime, stop)
         runtime.sleep.assert_awaited_once_with(58, stop, monitor_probe=True)
 
-    async def test_read_button_discovery_is_retained_and_does_not_replace_sensors(self):
+    async def test_discovery_groups_all_sensors_and_button_under_one_device(self):
         runtime = self.runtime()
         settings = app.Settings(
             address="88:56:A6:5B:03:56", read_command_topic="test/read/command",
             availability_topic="test/availability", discovery_prefix="test/discovery",
+            ph_topic="test/ph/state", temperature_topic="test/temperature/state",
+            probe_diagnostics_topic="test/diagnostics",
         )
-        await app.publish_read_button(settings, runtime)
-        call = runtime.publish.await_args
-        self.assertEqual(
-            call.args[0], "test/discovery/button/reef_probe_8856a65b0356/read_now/config",
-        )
-        config = json.loads(call.args[1])
-        self.assertEqual(config["name"], "Read now")
-        self.assertEqual(config["command_topic"], settings.read_command_topic)
-        self.assertEqual(config["payload_press"], "READ")
-        self.assertEqual(config["availability_topic"], settings.availability_topic)
-        self.assertEqual(config["qos"], 1)
-        self.assertIs(config["retain"], False)
-        self.assertEqual(config["unique_id"], "reef_probe_8856a65b0356_read_now")
-        runtime.publish.assert_awaited_once()
-        self.assertEqual(call.kwargs, {"retain": True})
+        settings.validate(require_credentials=False)
+        await app.publish_discovery(settings, runtime)
+        calls = runtime.publish.await_args_list
+        configs = {call.args[0].split("/")[-2]: json.loads(call.args[1]) for call in calls}
+        self.assertEqual(set(configs), {
+            "ph", "temperature", "read_now", "ph_voltage", "temperature_voltage",
+            "probe_status", "last_reading", "calibration_status",
+        })
+        self.assertEqual(len(calls), 8)
+        for call in calls:
+            config = json.loads(call.args[1])
+            key = call.args[0].split("/")[-2]
+            component = "button" if key == "read_now" else "sensor"
+            self.assertEqual(call.args[0],
+                             "test/discovery/%s/reef_probe_8856a65b0356/%s/config" % (component, key))
+            self.assertEqual(config["unique_id"], "reef_probe_8856a65b0356_" + key)
+            self.assertEqual(config["device"], configs["read_now"]["device"])
+            self.assertEqual(config["device"]["identifiers"], ["reef_probe_8856a65b0356"])
+            self.assertEqual(config["availability_topic"], settings.availability_topic)
+            self.assertEqual(call.kwargs, {"retain": True})
+            self.assertLessEqual(len(call.args[0].encode()) + len(call.args[1].encode()) + 8, 4096)
+        self.assertEqual(configs["read_now"]["command_topic"], settings.read_command_topic)
+        self.assertEqual(configs["read_now"]["payload_press"], "READ")
+        self.assertEqual(configs["read_now"]["qos"], 1)
+        self.assertIs(configs["read_now"]["retain"], False)
+        self.assertEqual(configs["ph"]["state_topic"], settings.ph_topic)
+        self.assertEqual(configs["temperature"]["state_topic"], settings.temperature_topic)
+        self.assertEqual(configs["temperature"]["device_class"], "temperature")
+        self.assertEqual(configs["temperature"]["unit_of_measurement"], "\u00b0C")
+        self.assertEqual(configs["ph"]["unit_of_measurement"], "pH")
+        for key, field in (("ph_voltage", "mv"), ("temperature_voltage", "temperature_mv")):
+            self.assertEqual(configs[key]["state_topic"], "test/diagnostics/summary")
+            self.assertEqual(configs[key]["value_template"], "{{ value_json.%s }}" % field)
+            self.assertEqual(configs[key]["unit_of_measurement"], "mV")
+        for key in ("ph", "temperature", "ph_voltage", "temperature_voltage"):
+            self.assertEqual(configs[key]["state_class"], "measurement")
+            self.assertEqual(configs[key]["expire_after"], 180)
+        for key in ("ph_voltage", "temperature_voltage", "probe_status",
+                    "last_reading", "calibration_status"):
+            self.assertEqual(configs[key]["entity_category"], "diagnostic")
+        self.assertEqual(configs["probe_status"]["state_topic"], "test/diagnostics/summary")
+        self.assertEqual(configs["last_reading"]["device_class"], "timestamp")
+        self.assertEqual(configs["last_reading"]["value_template"], "{{ value_json.ts }}")
+        self.assertEqual(configs["calibration_status"]["value_template"], "{{ 'disabled' }}")
         settings.client_id = "different-platform"
-        await app.publish_read_button(settings, runtime)
-        self.assertEqual(runtime.publish.await_args.args, call.args)
+        runtime.publish.reset_mock()
+        await app.publish_discovery(settings, runtime)
+        self.assertEqual(runtime.publish.await_args_list, calls)
+
+    async def test_discovery_is_enabled_by_default_and_can_be_disabled(self):
+        self.assertTrue(app.Settings().discovery_enabled)
+        runtime = self.runtime()
+        settings = app.Settings(discovery_enabled=False)
+        settings.validate(require_credentials=False)
+        await app.publish_discovery(settings, runtime)
+        runtime.publish.assert_not_awaited()
+        stop = asyncio.Event()
+        runtime.sleep.side_effect = lambda *args, **kwargs: stop.set()
+        await app.run_bridge(settings, runtime, stop)
+        self.assertFalse(any(call.args[0].endswith("/config")
+                             for call in runtime.publish.await_args_list))
+        runtime.read.assert_awaited_once()
+        for invalid in ("true", 1, None):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "boolean"):
+                app.Settings(discovery_enabled=invalid).validate(require_credentials=False)
+
+    async def test_calibration_discovery_status_stays_visible_when_measurements_are_inhibited(self):
+        settings = app.Settings(calibration_enabled=True, poll_interval=120)
+        configs = {topic.split("/")[-2]: config
+                   for topic, config in app.discovery_messages(settings)}
+        calibration = configs["calibration_status"]
+        self.assertEqual(calibration["state_topic"], settings.calibration_state_topic)
+        self.assertEqual(calibration["value_template"], "{{ value_json.state }}")
+        self.assertNotIn("availability_topic", calibration)
+        self.assertEqual(calibration["expire_after"], 360)
+        self.assertEqual(configs["ph"]["availability_topic"], settings.availability_topic)
+        self.assertEqual(configs["read_now"]["availability_topic"], settings.availability_topic)
+
+    async def test_discovery_publication_failure_is_reported_before_reading(self):
+        runtime = self.runtime()
+        stop = asyncio.Event()
+
+        async def publish(topic, payload, retain=True):
+            if topic.endswith("/config"):
+                raise OSError("discovery publication rejected")
+
+        runtime.publish.side_effect = publish
+        runtime.sleep.side_effect = lambda *args, **kwargs: stop.set()
+        await app.run_bridge(app.Settings(), runtime, stop)
+        runtime.read.assert_not_awaited()
+        self.assertTrue(any(call.args[0] == "error"
+                            and "publish Home Assistant discovery" in call.args[1]
+                            and "discovery publication rejected" in call.args[1]
+                            for call in runtime.report.call_args_list))
+
+    async def test_diagnostic_summary_survives_chunked_full_telemetry(self):
+        runtime = self.runtime()
+        settings = app.Settings()
+        telemetry = {**SAMPLE, "additional_firmware_data": "x" * 10000}
+        await app.publish_sample(settings, runtime, telemetry)
+        messages = {call.args[0]: json.loads(call.args[1])
+                    for call in runtime.publish.await_args_list
+                    if call.args[0] != settings.availability_topic}
+        self.assertEqual(messages[settings.probe_diagnostics_topic + "/summary"], {
+            "ts": STAMP, "status": "connected", "mv": 11, "temperature_mv": 1590,
+        })
+        self.assertEqual(messages[settings.probe_diagnostics_topic + "/telemetry"]["format"],
+                         "chunked-json")
+        self.assertEqual(messages[settings.ph_topic], state_messages(SAMPLE, STAMP)[0][1])
+        self.assertEqual(messages[settings.temperature_topic], state_messages(SAMPLE, STAMP)[1][1])
+
+    async def test_invalid_raw_diagnostics_do_not_publish_fabricated_values(self):
+        for overrides in ({"mv": None}, {"mv": float("nan")},
+                          {"temperature_mv": True}, {"temperature_mv": float("inf")}):
+            with self.subTest(overrides=overrides):
+                runtime = self.runtime()
+                with self.assertRaises(ProbeError):
+                    await app.publish_sample(app.Settings(), runtime, {**SAMPLE, **overrides})
+                runtime.publish.assert_not_awaited()
 
     async def test_read_now_interrupts_sixty_second_poll_with_fresh_values(self):
-        for calibration_enabled in (False, True):
-            with self.subTest(calibration_enabled=calibration_enabled):
+        for calibration_enabled, discovery_enabled in ((False, False), (False, True), (True, True)):
+            with self.subTest(calibration_enabled=calibration_enabled,
+                              discovery_enabled=discovery_enabled):
                 runtime = self.runtime()
-                settings = app.Settings(calibration_enabled=calibration_enabled)
+                settings = app.Settings(calibration_enabled=calibration_enabled,
+                                        discovery_enabled=discovery_enabled)
                 stop = asyncio.Event()
                 now = 0.0
                 starts = []
@@ -598,6 +719,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
             {"read_command_topic": ""}, {"read_command_topic": "reef/+/command"},
             {"read_command_topic": app.PH_TOPIC},
             {"read_command_topic": app.Settings().calibration_command_topic},
+            {"read_command_topic": next(app.discovery_messages(app.Settings()))[0]},
             {"discovery_prefix": ""}, {"discovery_prefix": "homeassistant/#"},
         ):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):

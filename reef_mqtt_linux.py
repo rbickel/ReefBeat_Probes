@@ -447,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
         help="opt in to MQTT calibration commands; incompatible with dry-run, check-broker and once",
     )
     parser.add_argument("--interval", type=float, default=POLL_INTERVAL_SECONDS, help="poll period in seconds")
+    parser.add_argument("--no-discovery", action="store_true", help="do not publish Home Assistant discovery")
     parser.add_argument("--debug", action="store_true", help="include raw BLE traffic in logs")
     args = parser.parse_args(argv)
     if args.enable_calibration and (args.dry_run or args.check_broker or args.once):
@@ -460,6 +461,7 @@ def main(argv: list[str] | None = None) -> int:
             password=os.environ.get("MQTT_PASSWORD", ""),
             client_id="reef-probe-" + socket.gethostname(),
             calibration_enabled=args.enable_calibration,
+            discovery_enabled=not args.no_discovery,
         )
         settings.validate(require_credentials=not args.dry_run)
         if settings.temperature_sensor == "ds18b20":

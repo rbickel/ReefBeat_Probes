@@ -83,7 +83,7 @@ set +a
 # No BLE operation or MQTT publishes; authenticate to 192.168.50.177:1883 only.
 .venv/bin/python reef_mqtt.py --check-broker
 
-# Read the real probe and preview the two messages, but do not contact MQTT.
+# Read the real probe and preview the messages, but do not contact MQTT.
 .venv/bin/python reef_mqtt.py --dry-run --once
 
 # Publish one real sample, then mark the bridge offline and exit.
@@ -93,22 +93,78 @@ set +a
 .venv/bin/python reef_mqtt.py
 ```
 
-Continuous mode publishes MQTT discovery for the **Read now button only**.
-Your existing MQTT sensors are not rediscovered or replaced, avoiding duplicate
-sensor entities. Entity IDs such as `sensor.reef_ph` are managed by Home
-Assistant, not by the state publisher.
+Continuous mode publishes Home Assistant MQTT discovery by default, creating
+one **ReefSense probe** device with the sensors, diagnostics, and Read now button
+described below. Entity IDs are managed by Home Assistant, not by the state
+publisher. Existing manually configured entities are not migrated automatically;
+remove or disable those entries to avoid duplicates.
 
 This broker uses unencrypted TCP port 1883 as requested. Keep it on your trusted
 LAN; credentials and measurements are not protected in transit. Do not commit
 or publicly share `.env`.
 
-### Read now from Home Assistant
+### Automatic Home Assistant discovery
 
 After deploying the updated bridge and restarting it, Home Assistant's MQTT
-integration automatically discovers a **Read now** button on a **ReefSense
-probe** device. MQTT discovery must be enabled in Home Assistant with the
-matching prefix (default `homeassistant`). Add that button entity to a dashboard
-for convenient testing; Home Assistant assigns its entity ID.
+integration automatically discovers one **ReefSense probe** device containing:
+
+| Entity | Type | Source |
+|---|---|---|
+| pH | Sensor | Existing pH state topic |
+| Temperature | Sensor | Existing temperature state topic |
+| Read now | Button | Fresh BLE reading of pH and temperature |
+| pH voltage | Diagnostic sensor, mV | Probe `mv` |
+| Temperature voltage | Diagnostic sensor, mV | Probe `temperature_mv` |
+| Probe status | Diagnostic sensor | Probe telemetry `status` |
+| Last reading | Diagnostic timestamp | Measurement receive timestamp `ts` |
+| Calibration status | Diagnostic sensor | `disabled`, or the calibration controller's current stage |
+
+MQTT discovery must be enabled in Home Assistant with the matching prefix
+(default `homeassistant`). All entities share a stable probe-address-based device
+identifier and unique IDs, including when switching between Linux and Pico W.
+pH and temperature reuse the existing measurement topics and units; all numeric
+sensors use measurement state classes. Sensors expire after the greater of 180 seconds or three polling
+intervals and honor measurement availability.
+
+Raw voltages and probe status use a small retained
+`<probe_diagnostics_topic>/summary` document (default
+`reef/reef_probe/diagnostics/summary`). Full firmware responses remain available
+on the existing diagnostic topics, including lossless chunking for large
+responses. The summary prevents large responses from breaking diagnostic
+templates. No extra BLE requests are needed for discovery or these diagnostics.
+Calibration status shows `disabled` unless calibration is explicitly enabled.
+When enabled it follows the controller state and uses expiry, not aquarium
+measurement availability, so it stays visible while calibration deliberately
+marks aquarium readings offline. Discovery does not authorize calibration.
+
+On **Pico W**, merge into the existing local `config.py` `OVERRIDES`:
+
+```python
+OVERRIDES = {
+    "discovery_enabled": True,
+    "discovery_prefix": "homeassistant",
+}
+```
+
+Keep other overrides and credentials. Set **`"discovery_enabled": False`** to stop
+automatic discovery announcements; ordinary readings and the read command topic
+continue to work. Linux uses the same defaults and supports `--no-discovery`.
+Previously retained discovery configurations remain until removed from the
+broker/Home Assistant; disabling discovery does not delete entities or history.
+To remove an old discovery configuration, publish an empty retained payload to
+its corresponding discovery `config` topic.
+
+Configurations are retained at
+`<discovery_prefix>/<sensor-or-button>/reef_probe_<probe-address>/<entity>/config`
+(address lowercased without colons/hyphens). Broker ACLs must allow the bridge to
+publish those topics and Home Assistant to receive them. If you previously
+created manual MQTT entities, disable or remove their definitions before using
+the new discovered entities to avoid duplicate sensors/devices.
+
+### Read now from Home Assistant
+
+Add the discovered **Read now** button to a dashboard for convenient testing;
+Home Assistant assigns its entity ID.
 
 Pressing it requests a **fresh BLE reading of both pH and temperature** and
 publishes the results to the existing state topics. Command processing wakes
@@ -138,20 +194,16 @@ data:
   retain: false
 ```
 
-`read_command_topic` and `discovery_prefix` are canonical Settings fields; on
-Pico they can be changed through `OVERRIDES`. Discovery configuration is retained
-under `<discovery_prefix>/button/reef_probe_<probe-address>/read_now/config`
-(address lowercased without colons/hyphens). The button's identity is stable
-across bridge restarts and Linux/Pico switches. Broker ACLs must allow the bridge
-to subscribe to the read command topic at QoS 1 and publish its discovery
-configuration, and allow Home Assistant to publish read requests. Always send
+`read_command_topic` is a canonical Settings field; on Pico it can be changed
+through `OVERRIDES`. Broker ACLs must allow the bridge to subscribe to this topic
+at QoS 1 and allow Home Assistant to publish read requests. Always send
 commands with `retain: false`; retained replays and invalid payloads are ignored
 with a warning.
 
 This is read-only and **does not require enabling calibration**. During
 calibration, recovery, or settling, measurement availability keeps the button
 unavailable, and read requests cannot bypass the calibration interlock.
-`--once` and `--check-broker` do not publish button discovery;
+`--once` and `--check-broker` do not publish discovery;
 `--dry-run` only prints a preview and never contacts MQTT.
 
 ### Availability and stale readings
@@ -164,9 +216,10 @@ Malformed/non-finite telemetry, non-`connected` sensor status, or an unsynchroni
 clock are **not** replaced with zeros or prior measurements. On recovery the
 bridge fetches a fresh reading instead of replaying its old sample.
 
-Retained state messages are deliberately not deleted on outages. In your
-**existing** Home Assistant MQTT sensor definitions, keep the state topics and
-`value_template: "{{ value_json.value }}"`, and add the equivalent of:
+Retained state messages are deliberately not deleted on outages. Discovered
+sensors already include availability and expiry. If keeping **manual** Home
+Assistant MQTT sensor definitions with discovery disabled, keep the state topics
+and `value_template: "{{ value_json.value }}"`, and add the equivalent of:
 
 ```yaml
 availability_topic: reef/reef_probe/availability
@@ -1172,6 +1225,9 @@ Read-now tests cover button discovery, fresh pH/temperature publication without
 waiting 60 seconds, normal polling after a manual read, retained/invalid request
 rejection, burst coalescing, serialized requests during BLE reads, and calibration
 interlocks, including the actual shared application through the mocked Pico driver.
+Discovery tests verify all eight entities share one device, enabled/disabled
+configuration on Linux and Pico, sensor units/templates/expiry, calibration-status
+visibility, and bounded diagnostic summaries even when full responses are chunked.
 Validation for the MQTT calibration implementation: **244 offline tests passed**
 (158 shared/Linux/diagnostic tests and 86 Pico tests), including the actual shared
 calibration controller driven through the mocked Pico MQTT/BLE transport.

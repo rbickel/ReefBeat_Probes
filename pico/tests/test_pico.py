@@ -1178,7 +1178,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         messages = self.hardware.clients[0].publications
         self.assertEqual([topic.decode() for topic, _, _, _ in messages], [
             self.settings.availability_topic, self.settings.ph_topic,
-            self.settings.temperature_topic, self.settings.probe_diagnostics_topic + "/telemetry",
+            self.settings.temperature_topic, self.settings.probe_diagnostics_topic + "/summary",
+            self.settings.probe_diagnostics_topic + "/telemetry",
             self.settings.availability_topic,
             self.settings.availability_topic,
         ])
@@ -1192,6 +1193,23 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ph["ts"], temperature["ts"])
         self.assertEqual(self.hardware.ntp_calls, 1)
         self.assertEqual(self.hardware.connections[0].disconnects, 1)
+
+    async def test_discovery_can_be_disabled_on_pico_without_disabling_readings(self):
+        self.settings.discovery_enabled = False
+        self.runtime.led = None
+        stop = asyncio.Event()
+
+        async def stop_after_poll(seconds, event, monitor_probe=False):
+            event.set()
+
+        with patch.object(self.runtime, "sleep", side_effect=stop_after_poll):
+            await reef_mqtt.run_bridge(self.settings, self.runtime, stop)
+        messages = self.hardware.clients[0].publications
+        self.assertFalse(any(topic.endswith(b"/config") for topic, _, _, _ in messages))
+        self.assertEqual({topic.decode() for topic, _, _, _ in messages
+                          if topic.decode() in (self.settings.ph_topic, self.settings.temperature_topic)},
+                         {self.settings.ph_topic, self.settings.temperature_topic})
+        self.assertEqual(self.hardware.connections[0].writer.writes, [pico_runtime.GET_TELEMETRY])
 
     async def test_read_now_button_requests_fresh_values_without_calibration(self):
         from test_pico_mqtt import command
@@ -1241,6 +1259,11 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                          [pico_runtime.GET_TELEMETRY] * 2)
         self.assertTrue(any(topic.endswith(b"/read_now/config") and retain
                             for topic, _, retain, _ in messages))
+        configs = [json.loads(payload) for topic, payload, _, _ in messages
+                   if topic.endswith(b"/config")]
+        self.assertEqual(len(configs), 8)
+        self.assertEqual({tuple(config["device"]["identifiers"]) for config in configs},
+                         {("reef_probe_8856a65b0356",)})
 
     async def test_fatal_payload_error_leaves_pico_led_on_in_calibration_mode(self):
         self.settings.calibration_enabled = True
@@ -1526,7 +1549,8 @@ class DriverTests(unittest.TestCase):
         local_config = SimpleNamespace(
             WIFI_SSID="offline-test-ssid", WIFI_PASSWORD="",
             MQTT_USERNAME="reefpi", MQTT_PASSWORD="offline-test-placeholder",
-            MQTT_CLIENT_ID="pico-unit-test", OVERRIDES={"mqtt_timeout": 3.0},
+            MQTT_CLIENT_ID="pico-unit-test",
+            OVERRIDES={"mqtt_timeout": 3.0, "discovery_enabled": False},
         )
         runtime_factory = Mock()
         canonical_loop = AsyncMock()
@@ -1538,6 +1562,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(settings.wifi_ssid, local_config.WIFI_SSID)
         self.assertEqual(settings.username, local_config.MQTT_USERNAME)
         self.assertEqual(settings.mqtt_timeout, 3.0)
+        self.assertFalse(settings.discovery_enabled)
         canonical_loop.assert_awaited_once()
         self.assertIs(canonical_loop.call_args.args[0], settings)
         self.assertIs(canonical_loop.call_args.args[1], runtime_factory.return_value)

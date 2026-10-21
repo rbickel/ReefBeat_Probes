@@ -51,7 +51,7 @@ Optional `OVERRIDES` uses **canonical lower-case Settings field names**, such as
 `mqtt_timeout`, `retry_min`, `retry_max`, `ntp_host`, `ph_topic`,
 `temperature_topic`, `availability_topic`, `temperature_sensor`, `wifi_timeout`,
 `wifi_disable_power_save`, `wifi_country`, `status_led`, `read_command_topic`,
-and `discovery_prefix`.
+`discovery_enabled`, and `discovery_prefix`.
 Defaults live in the root module, not a duplicate Pico configuration class.
 The example uses the shared ten-second `mqtt_timeout`. An older board config
 may still override it with three seconds; changing the example on the computer
@@ -107,14 +107,46 @@ The original installation defaults are broker `192.168.50.177:1883`, probe
 Both payloads default to the `redsea_ph` sensor label;
 **the temperature comes from ReefSense, not a separate DS18B20**.
 Override `temperature_sensor` with `ds18b20` only if a legacy consumer needs it.
-Existing sensor entities are not automatically rediscovered or replaced.
+Existing manual MQTT entities are not automatically migrated to discovery.
+
+### Automatic Home Assistant discovery
+
+Discovery is **enabled by default**. With Home Assistant MQTT discovery enabled,
+continuous mode creates one **ReefSense probe** device containing pH, temperature,
+Read now, pH voltage, temperature voltage, probe status, last-reading timestamp,
+and calibration status. The last five sensors are categorized as diagnostics.
+Calibration status shows `disabled` until calibration is explicitly enabled;
+discovery itself never enables calibration or sends calibration POSTs.
+
+Merge this into the board's existing `config.py` `OVERRIDES`, retaining other
+overrides and credentials:
+
+```python
+OVERRIDES = {
+    "discovery_enabled": True,
+    "discovery_prefix": "homeassistant",
+}
+```
+
+Set **`"discovery_enabled": False`** to disable discovery announcements without
+disabling measurements or read commands. Previously retained discovery configs
+are not deleted automatically; remove them from the broker/Home Assistant if
+you no longer want those entities. Remove or disable old manual MQTT sensor
+definitions when using discovery to avoid duplicate entities/devices.
+The discovery prefix must match Home Assistant's MQTT integration.
+
+All entity IDs are assigned by Home Assistant. Stable unique IDs and the shared
+device identifier are derived from the probe address, not the Pico's MQTT client
+ID. Measurement sensors include availability and expiry; the calibration-status
+sensor remains visible during active calibration and expires if updates stop.
+Raw-voltage/status entities use the bounded
+`reef/reef_probe/diagnostics/summary` topic by default, independently of the full
+diagnostic records. See [complete discovery behavior](../README.md#automatic-home-assistant-discovery).
 
 ### Read now button in Home Assistant
 
-Continuous mode automatically discovers a **Read now** button on the **ReefSense
-probe** MQTT device, using `discovery_prefix="homeassistant"` by default.
-Press it to request fresh pH and temperature values without waiting for the next
-60-second poll. The Pico services requests during its 250 ms wait checks; the
+Press the discovered **Read now** button to request fresh pH and temperature
+values without waiting for the next 60-second poll. The Pico services requests during its 250 ms wait checks; the
 probe's BLE response time is additional. Normal polling continues afterward.
 
 The default `read_command_topic` is `reef/reef_probe/read/command`. Commands use
@@ -126,7 +158,7 @@ ignored.
 Update the board-root copies of [../reef_mqtt.py](../reef_mqtt.py),
 [pico_runtime.py](pico_runtime.py), and [pico_mqtt.py](pico_mqtt.py) together and
 restart the MicroPython backend, preserving `config.py` and credentials.
-See [Home Assistant setup and broker permissions](../README.md#read-now-from-home-assistant).
+See [Home Assistant setup and broker permissions](../README.md#automatic-home-assistant-discovery).
 
 ## Copy and install on the board
 
@@ -436,7 +468,10 @@ partial/interleaved MQTT packets, QoS/DUP/retain metadata, SUBACK errors, limits
 restricted BLE operations, sequential MTU fragmentation, serialization and
 failed-stream poisoning. Read-now tests verify exact-topic routing and multi-topic
 SUBACK validation, plus fresh readings after 250 ms of simulated waiting through
-the actual shared application. They also check the absence of callback-owned BLE
+the actual shared application. They also verify that discovery groups all eight
+entities under one device, the Pico configuration passes `discovery_enabled`
+through unchanged, and disabling discovery preserves readings. They check the
+absence of callback-owned BLE
 operations and adapter-owned availability publication. Application-loop tests
 belong primarily to the root implementation; a bounded Pico integration test
 also runs the actual shared calibration loop from start through mid-point
