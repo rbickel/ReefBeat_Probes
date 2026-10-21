@@ -93,14 +93,66 @@ set +a
 .venv/bin/python reef_mqtt.py
 ```
 
-No discovery/config messages are sent: your existing MQTT entities already
-subscribe to these topics, and guessing their discovery unique IDs could create
-duplicates. Entity IDs such as `sensor.reef_ph` are managed by Home Assistant,
-not by the state publisher.
+Continuous mode publishes MQTT discovery for the **Read now button only**.
+Your existing MQTT sensors are not rediscovered or replaced, avoiding duplicate
+sensor entities. Entity IDs such as `sensor.reef_ph` are managed by Home
+Assistant, not by the state publisher.
 
 This broker uses unencrypted TCP port 1883 as requested. Keep it on your trusted
 LAN; credentials and measurements are not protected in transit. Do not commit
 or publicly share `.env`.
+
+### Read now from Home Assistant
+
+After deploying the updated bridge and restarting it, Home Assistant's MQTT
+integration automatically discovers a **Read now** button on a **ReefSense
+probe** device. MQTT discovery must be enabled in Home Assistant with the
+matching prefix (default `homeassistant`). Add that button entity to a dashboard
+for convenient testing; Home Assistant assigns its entity ID.
+
+Pressing it requests a **fresh BLE reading of both pH and temperature** and
+publishes the results to the existing state topics. Command processing wakes
+within approximately 250 ms while the bridge is waiting; the actual reading
+still takes the probe's BLE response time. It does not replay cached values.
+Normal 60-second start-to-start polling continues from the requested reading.
+Multiple presses queued together are coalesced into one request, and requests
+received during an in-flight read run afterward, never concurrently.
+
+The same button works with the Linux and Pico W adapters. To deploy:
+
+- **Linux/Pi:** update [reef_mqtt.py](reef_mqtt.py) and
+  [reef_mqtt_linux.py](reef_mqtt_linux.py), then restart the bridge
+  (`sudo systemctl restart reef-mqtt.service` if using the supplied service).
+- **Pico W:** update the board-root copies of [reef_mqtt.py](reef_mqtt.py),
+  [pico_runtime.py](pico/pico_runtime.py), and [pico_mqtt.py](pico/pico_mqtt.py)
+  together, preserve local `config.py`, then restart the MicroPython backend.
+
+The MQTT interface is also usable from Home Assistant's `mqtt.publish` action:
+
+```yaml
+action: mqtt.publish
+data:
+  topic: reef/reef_probe/read/command
+  payload: "READ"
+  qos: 1
+  retain: false
+```
+
+`read_command_topic` and `discovery_prefix` are canonical Settings fields; on
+Pico they can be changed through `OVERRIDES`. Discovery configuration is retained
+under `<discovery_prefix>/button/reef_probe_<probe-address>/read_now/config`
+(address lowercased without colons/hyphens). The button's identity is stable
+across bridge restarts and Linux/Pico switches. Broker ACLs must allow the bridge
+to subscribe to the read command topic at QoS 1 and publish its discovery
+configuration, and allow Home Assistant to publish read requests. Always send
+commands with `retain: false`; retained replays and invalid payloads are ignored
+with a warning.
+
+This is read-only and **does not require enabling calibration**. During
+calibration, recovery, or settling, measurement availability keeps the button
+unavailable, and read requests cannot bypass the calibration interlock.
+`--once` and `--check-broker` do not publish button discovery;
+`--dry-run` only prints a preview and never contacts MQTT.
 
 ### Availability and stale readings
 
@@ -1116,6 +1168,10 @@ validation, duplicate commands, retained deliveries, persistence across reboot,
 partial writes, cancellations and no aquarium publication while in buffers.
 Transport tests cover subscription failures, partial/interleaved MQTT packets,
 QoS 1 acknowledgements, queue bounds, reconnects and BLE write restrictions.
+Read-now tests cover button discovery, fresh pH/temperature publication without
+waiting 60 seconds, normal polling after a manual read, retained/invalid request
+rejection, burst coalescing, serialized requests during BLE reads, and calibration
+interlocks, including the actual shared application through the mocked Pico driver.
 Validation for the MQTT calibration implementation: **244 offline tests passed**
 (158 shared/Linux/diagnostic tests and 86 Pico tests), including the actual shared
 calibration controller driven through the mocked Pico MQTT/BLE transport.

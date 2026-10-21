@@ -13,6 +13,9 @@ from test_pico import Client, Clock, Socket
 
 
 TOPIC = b"reef/sump_ph/calibration/command"
+READ_TOPIC = b"reef/reef_probe/read/command"
+TOPIC_TEXT = TOPIC.decode()
+READ_TOPIC_TEXT = READ_TOPIC.decode()
 
 
 def packet(op, body=b""):
@@ -39,6 +42,7 @@ class WireSocket(Socket):
         self.read_limit = 4096
         self.before_suback = b""
         self.ack_pid = None
+        self.ack_codes = None
         self.auto_suback = True
         self.write_limit = None
         self.advance = None
@@ -56,11 +60,7 @@ class WireSocket(Socket):
             data = data[:self.write_limit]
         self.writes.append(data)
         if data[0] == 0x82 and self.auto_suback:
-            index = 1
-            while data[index] & 128:
-                index += 1
-            pid = self.ack_pid or data[index + 1:index + 3]
-            self.feed(self.before_suback + b"\x90\x03" + pid + bytes((self.suback,)))
+            self.feed(self.before_suback + self.subscription_ack(data, self.ack_pid, self.ack_codes))
         return len(data)
 
 
@@ -77,9 +77,12 @@ class WireClient(Client):
 
 
 class MQTTWireTests(unittest.TestCase):
-    def make(self, enabled=True):
+    def make(self, enabled=True, read_enabled=False):
         client = WireClient()
-        publisher = Publisher(client, "availability", 3, command_topic=TOPIC if enabled else None)
+        publisher = Publisher(
+            client, "availability", 3, command_topic=TOPIC if enabled else None,
+            read_command_topic=READ_TOPIC if read_enabled else None,
+        )
         self.addCleanup(publisher.close)
         return client, publisher
 
@@ -98,13 +101,54 @@ class MQTTWireTests(unittest.TestCase):
         self.assertEqual(client.wire.writes, [])
         self.assertEqual(publisher.commands(), [])
 
+    def test_read_only_subscription_does_not_enable_calibration(self):
+        client, publisher = self.make(enabled=False, read_enabled=True)
+        publisher.connect()
+        self.assertEqual(publisher.command_topics, (READ_TOPIC,))
+        client.wire.feed(command(b"READ", topic=READ_TOPIC))
+        self.assertEqual(publisher.commands(), [(READ_TOPIC_TEXT, b"READ", False)])
+        client.wire.feed(command(topic=TOPIC))
+        with self.assertRaisesRegex(OSError, "outside the command subscription"):
+            publisher.commands()
+
+    def test_read_and_calibration_topics_share_one_subscription_and_keep_routing(self):
+        client, publisher = self.make(read_enabled=True)
+        publisher.connect()
+        expected = packet(
+            0x82, b"\0\1\0" + bytes((len(READ_TOPIC),)) + READ_TOPIC + b"\1\0"
+            + bytes((len(TOPIC),)) + TOPIC + b"\1",
+        )
+        self.assertEqual(client.wire.writes, [expected])
+        client.wire.feed(command(b"READ", topic=READ_TOPIC) +
+                         command(b"calibration", retained=True, pid=8))
+        self.assertEqual(publisher.commands(), [
+            (READ_TOPIC_TEXT, b"READ", False), (TOPIC_TEXT, b"calibration", True),
+        ])
+
+    def test_multi_topic_suback_must_grant_qos_one_for_every_topic(self):
+        for codes in ([1], [1, 128], [0, 1], [1, 2], [1, 1, 1]):
+            client, publisher = self.make(read_enabled=True)
+            client.wire.ack_codes = codes
+            with self.subTest(codes=codes), self.assertRaisesRegex(OSError, "SUBACK"):
+                publisher.connect()
+            self.assertFalse(publisher.connected)
+
+    def test_multi_topic_subscribe_packet_must_fit_transport_limit(self):
+        with self.assertRaisesRegex(ValueError, "too long"):
+            Publisher(WireClient(), "availability", 3,
+                      command_topic=b"c" * 2044, read_command_topic=b"r" * 2044)
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            Publisher(WireClient(), "availability", 3,
+                      command_topic=TOPIC, read_command_topic=TOPIC)
+
     def test_partial_suback_retained_publish_and_pingresp_interleaved(self):
         client, publisher = self.make()
         client.wire.read_limit = 1
         client.wire.before_suback = command(b"retained", retained=True) + b"\xd0\0"
         client.wire.response = command(b"live", qos=0) + b"\xd0\0"
         publisher.connect()
-        self.assertEqual(publisher.commands(), [(b"retained", True), (b"live", False)])
+        self.assertEqual(publisher.commands(),
+                         [(TOPIC_TEXT, b"retained", True), (TOPIC_TEXT, b"live", False)])
         self.assertIn(b"\x40\x02\0\x07", client.wire.writes)
         self.assertTrue(publisher.connected)
 
@@ -113,7 +157,8 @@ class MQTTWireTests(unittest.TestCase):
         publisher.connect()
         client.wire.feed(command(b"same", retained=True) +
                          command(b"same", duplicate=True, retained=True))
-        self.assertEqual(publisher.commands(), [(b"same", True), (b"same", True)])
+        self.assertEqual(publisher.commands(),
+                         [(TOPIC_TEXT, b"same", True), (TOPIC_TEXT, b"same", True)])
         self.assertEqual(client.wire.writes.count(b"\x40\x02\0\x07"), 2)
 
     def test_callback_gets_qos_dup_retain_after_puback_not_ble(self):
@@ -195,7 +240,7 @@ class MQTTWireTests(unittest.TestCase):
         self.assertEqual(publisher._queue, [])
         self.assertTrue(publisher._rx)
         client.wire.feed(data[-2:])
-        self.assertEqual(publisher.commands(), [(b"slow", True)])
+        self.assertEqual(publisher.commands(), [(TOPIC_TEXT, b"slow", True)])
         self.assertEqual(client.wire.timeout, 3)
         self.assertTrue(client.wire.blocking)
 
@@ -212,7 +257,7 @@ class MQTTWireTests(unittest.TestCase):
         self.assertTrue(publisher._rx)
         client.wire.response = partial[13:] + b"\xd0\0"
         publisher.ping()
-        self.assertEqual(publisher.commands(), [(first, False), (second, True)])
+        self.assertEqual(publisher.commands(), [(TOPIC_TEXT, first, False), (TOPIC_TEXT, second, True)])
         self.assertIn(b"\x40\x02\0\x08", client.wire.writes)
         self.assertEqual(publisher.commands(), [])
 
@@ -257,7 +302,7 @@ class MQTTWireTests(unittest.TestCase):
             publisher.connect()
             client.wire.feed(command(b"x" * size))
             if size == 1024:
-                self.assertEqual(publisher.commands(), [(b"x" * size, False)])
+                self.assertEqual(publisher.commands(), [(TOPIC_TEXT, b"x" * size, False)])
             else:
                 with self.assertRaisesRegex(OSError, "1024"):
                     publisher.commands()
@@ -290,7 +335,7 @@ class MQTTWireTests(unittest.TestCase):
         client.wire.writes.clear()
         client.wire.write_limit = 1
         client.wire.feed(command())
-        self.assertEqual(publisher.commands(), [(b"{}", False)])
+        self.assertEqual(publisher.commands(), [(TOPIC_TEXT, b"{}", False)])
         self.assertEqual(b"".join(client.wire.writes), b"\x40\x02\0\x07")
 
     def test_publish_retention_parameter_and_interleaved_commands(self):
@@ -300,7 +345,7 @@ class MQTTWireTests(unittest.TestCase):
         pings = client.pings
         publisher.publish("event", '{"ok":true}', retain=False)
         self.assertEqual(client.publications, [(b"event", b'{"ok":true}', False, 0)])
-        self.assertEqual(publisher.commands(), [(b"next", False)])
+        self.assertEqual(publisher.commands(), [(TOPIC_TEXT, b"next", False)])
         self.assertTrue(publisher.connected)
         self.assertEqual(client.pings, pings)
 

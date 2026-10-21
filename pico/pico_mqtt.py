@@ -49,7 +49,8 @@ def _length(value):
 class Publisher:
     """Use upstream CONNECT/QoS0 sends, not its blocking inbound/subscribe code."""
 
-    def __init__(self, client, availability_topic, socket_timeout, qos=0, command_topic=None):
+    def __init__(self, client, availability_topic, socket_timeout, qos=0, command_topic=None,
+                 read_command_topic=None):
         if qos != 0:
             raise ValueError("Pico transport supports bounded QoS 0 publishing only")
         if socket_timeout <= 0:
@@ -57,8 +58,13 @@ class Publisher:
         self.client = client
         self.availability_topic = _topic(availability_topic)
         self.command_topic = _topic(command_topic) if command_topic is not None else None
-        if self.command_topic is not None and len(self.command_topic) + 8 > MAX_PACKET_SIZE:
-            raise ValueError("MQTT command topic is too long")
+        self.command_topics = tuple(_topic(topic) for topic in (read_command_topic, command_topic)
+                                    if topic is not None)
+        if len(set(self.command_topics)) != len(self.command_topics):
+            raise ValueError("MQTT command topics must be distinct")
+        size = 2 + sum(3 + len(topic) for topic in self.command_topics)
+        if 1 + len(_length(size)) + size > MAX_PACKET_SIZE:
+            raise ValueError("MQTT command topics are too long")
         self.socket_timeout = socket_timeout
         self.qos = qos
         self.connected = False
@@ -109,7 +115,7 @@ class Publisher:
                 total = 1 + index + value
                 if total > MAX_PACKET_SIZE:
                     raise OSError("MQTT packet exceeds 4096 bytes")
-                if op == 0x90 and value != 3:
+                if op == 0x90 and value != 2 + len(self.command_topics):
                     raise OSError("invalid MQTT SUBACK length")
                 if op == 0xD0 and value != 0:
                     raise OSError("invalid MQTT PINGRESP length")
@@ -170,7 +176,7 @@ class Publisher:
             return
         if op == 0x90:
             pid = (body[0] << 8) | body[1]
-            if self._suback is None or pid != self._suback or body[2] != 1:
+            if self._suback is None or pid != self._suback or any(code != 1 for code in body[2:]):
                 raise OSError("MQTT SUBACK rejected or did not grant requested QoS 1")
             self._suback = None
             return
@@ -184,7 +190,7 @@ class Publisher:
             topic = _topic(body[2:index])
         except ValueError as exc:
             raise OSError(str(exc))
-        if self.command_topic is None or topic != self.command_topic:
+        if topic not in self.command_topics:
             raise OSError("MQTT PUBLISH outside the command subscription")
         qos = (op >> 1) & 3
         pid = None
@@ -209,7 +215,7 @@ class Publisher:
         # QoS duplicates deliberately reach the shared controller's replay guard.
         if len(self._queue) >= COMMAND_QUEUE_SIZE:
             raise OSError("MQTT command queue overflow")
-        self._queue.append((payload, retained))
+        self._queue.append((topic.decode("utf-8"), payload, retained))
 
     def _wait(self, start, timeout=None):
         while self._suback is not None or self._ping_pending:
@@ -230,12 +236,12 @@ class Publisher:
             session_present = self.client.connect(clean_session=True, timeout=self.socket_timeout)
             if session_present:
                 raise OSError("MQTT clean session unexpectedly resumed")
-            if self.command_topic is not None:
-                topic = self.command_topic
+            if self.command_topics:
                 self._pid = self._pid % 65535 + 1
                 self._suback = self._pid
-                body = bytes((self._pid >> 8, self._pid & 255, len(topic) >> 8,
-                              len(topic) & 255)) + topic + b"\x01"
+                body = bytes((self._pid >> 8, self._pid & 255))
+                for topic in self.command_topics:
+                    body += bytes((len(topic) >> 8, len(topic) & 255)) + topic + b"\x01"
                 start = _ticks()
                 self._write(b"\x82" + _length(len(body)) + body, start)
                 self._wait(start)

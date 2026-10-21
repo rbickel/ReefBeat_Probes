@@ -27,6 +27,8 @@ OVERRIDES = {
     # "status_led": True,  # Fast=start/reconnect, slow=error, heartbeat=healthy.
     # "host": "192.168.50.177",
     # "poll_interval": 60.0,
+    # "read_command_topic": "reef/reef_probe/read/command",
+    # "discovery_prefix": "homeassistant",
     # "temperature_sensor": "redsea_ph",  # Use ds18b20 only for legacy consumers.
     # "ntp_host": "192.168.50.1",  # Only if this really is your trusted NTP server.
 }

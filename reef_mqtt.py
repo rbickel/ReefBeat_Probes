@@ -17,6 +17,7 @@ PH_TOPIC = "reef/sump_ph/state"
 TEMPERATURE_TOPIC = "reef/tank_main_temp/state"
 TEMPERATURE_SENSOR_LABEL = "redsea_ph"
 AVAILABILITY_TOPIC = "reef/reef_probe/availability"
+READ_COMMAND_TOPIC = "reef/reef_probe/read/command"
 MQTT_QOS = 0
 
 
@@ -29,6 +30,7 @@ class Settings:
             "temperature_topic": TEMPERATURE_TOPIC,
             "temperature_sensor": TEMPERATURE_SENSOR_LABEL,
             "availability_topic": AVAILABILITY_TOPIC, "qos": MQTT_QOS,
+            "read_command_topic": READ_COMMAND_TOPIC, "discovery_prefix": "homeassistant",
             "scan_timeout": 15.0, "request_timeout": 15.0, "mqtt_timeout": 10.0,
             "retry_min": 5.0, "retry_max": 60.0,
             "wifi_ssid": "", "wifi_password": "", "ntp_host": "pool.ntp.org",
@@ -97,14 +99,17 @@ class Settings:
             raise ValueError("Availability topic must not overwrite a sensor state")
         validate_topics(self.ph_topic, self.temperature_topic, self.temperature_sensor)
         topics = [self.ph_topic, self.temperature_topic, self.availability_topic]
-        for key in ("calibration_command_topic", "calibration_state_topic", "calibration_event_topic",
+        for key in ("read_command_topic", "discovery_prefix",
+                    "calibration_command_topic", "calibration_state_topic", "calibration_event_topic",
                     "calibration_failure_topic", "probe_diagnostics_topic"):
             topic = getattr(self, key)
             if not isinstance(topic, str) or not topic or any(c in topic for c in ("+", "#", "\0")):
                 raise ValueError("Invalid " + key)
-            topics.append(topic)
+            if key != "discovery_prefix":
+                topics.append(topic)
+        topics.append(read_button_discovery(self)[0])
         if len(set(topics)) != len(topics):
-            raise ValueError("Calibration, measurement and availability topics must be distinct")
+            raise ValueError("Command, discovery, calibration, measurement and availability topics must be distinct")
         diagnostic_roots = (self.probe_diagnostics_topic, self.calibration_failure_topic,
                             self.calibration_event_topic)
         for root in diagnostic_roots:
@@ -163,9 +168,62 @@ async def close_runtime(runtime):
     except runtime.errors as exc:
         runtime.report("error", "Transport cleanup failed: %s" % describe_error(exc))
 
+
+def read_button_discovery(settings):
+    identifier = "reef_probe_" + settings.address.lower().replace(":", "").replace("-", "")
+    return settings.discovery_prefix + "/button/" + identifier + "/read_now/config", {
+        "name": "Read now", "unique_id": identifier + "_read_now",
+        "command_topic": settings.read_command_topic, "payload_press": "READ",
+        "qos": 1, "retain": False, "icon": "mdi:refresh",
+        "availability_topic": settings.availability_topic,
+        "payload_available": "online", "payload_not_available": "offline",
+        "device": {
+            "identifiers": [identifier], "name": "ReefSense probe",
+            "manufacturer": "Red Sea", "model": "ReefSense pH",
+        },
+    }
+
+
+async def publish_read_button(settings, runtime):
+    topic, config = read_button_discovery(settings)
+    await runtime.publish(topic, json.dumps(config), retain=True)
+
+
+async def handle_commands(settings, runtime, calibration=None):
+    read_requested = False
+    for topic, payload, retained in await runtime.commands():
+        if topic == settings.read_command_topic:
+            if retained:
+                runtime.report("warning", "Ignoring retained read request; send with retain=false")
+            elif payload != b"READ":
+                runtime.report("warning", "Ignoring invalid read request; expected READ")
+            elif calibration is not None and calibration.inhibits_measurements:
+                runtime.report("warning", "Ignoring read request while calibration inhibits measurements")
+            else:
+                read_requested = True
+        elif calibration is not None and topic == settings.calibration_command_topic:
+            await calibration.handle(runtime, payload, retained)
+        else:
+            runtime.report("warning", "Ignoring command on unexpected or disabled topic: " + topic)
+    if read_requested:
+        runtime.report("info", "Fresh probe reading requested via MQTT")
+    return read_requested
+
+
+async def wait_for_next_poll(settings, runtime, stop, started):
+    while not stop.is_set():
+        if await handle_commands(settings, runtime):
+            return
+        remaining = settings.poll_interval - runtime.elapsed(started)
+        if remaining <= 0:
+            return
+        await runtime.sleep(remaining, stop, monitor_probe=True)
+
+
 async def calibration_loop(settings, runtime, stop, calibration, on_success=None):
     """Service MQTT each second while retaining the configured measurement period."""
     poll_started = None
+    read_requested = False
     await calibration.connected(runtime)
     announced = runtime.ticks()
     while not stop.is_set():
@@ -173,21 +231,22 @@ async def calibration_loop(settings, runtime, stop, calibration, on_success=None
         if runtime.elapsed(announced) >= 30:
             await calibration.announce(runtime)
             announced = runtime.ticks()
-        for payload, retained in await runtime.commands():
-            await calibration.handle(runtime, payload, retained)
+        read_requested = await handle_commands(settings, runtime, calibration) or read_requested
         was_inhibited = calibration.inhibits_measurements
         if was_inhibited:
+            read_requested = False
             await calibration.tick(runtime)
             if not calibration.inhibits_measurements:
                 poll_started = None
         if not calibration.inhibits_measurements and (
-            poll_started is None or runtime.elapsed(poll_started) >= settings.poll_interval
+            read_requested or poll_started is None
+            or runtime.elapsed(poll_started) >= settings.poll_interval
         ):
+            read_requested = False
             poll_started = runtime.ticks()
             telemetry = await runtime.read()
             # A start command received during the BLE read wins over publication.
-            for payload, retained in await runtime.commands():
-                await calibration.handle(runtime, payload, retained)
+            read_requested = await handle_commands(settings, runtime, calibration)
             if not calibration.inhibits_measurements:
                 await calibration.observe(runtime, telemetry)
             if not calibration.inhibits_measurements:
@@ -196,7 +255,9 @@ async def calibration_loop(settings, runtime, stop, calibration, on_success=None
             on_success()
         delay = 1.0
         if not calibration.inhibits_measurements and poll_started is not None:
-            delay = min(delay, max(0, settings.poll_interval - runtime.elapsed(poll_started)))
+            delay = 0 if read_requested else min(
+                delay, max(0, settings.poll_interval - runtime.elapsed(poll_started)),
+            )
         await runtime.sleep(delay, stop, monitor_probe=True)
 
 
@@ -226,6 +287,9 @@ async def run_bridge(settings, runtime, stop, once=False):
             try:
                 await runtime.prepare()
                 await mark_offline(settings, runtime)
+                if not once:
+                    stage = "publish reading button discovery"
+                    await publish_read_button(settings, runtime)
                 if calibration is not None and calibration.failure_pending:
                     await calibration.announce(runtime)
                 stage = "connect and subscribe BLE"
@@ -241,6 +305,8 @@ async def run_bridge(settings, runtime, stop, once=False):
                     # Reconnect before measuring; never replay stale values on recovery.
                     stage = "check MQTT before reading"
                     await runtime.prepare()
+                    if not once:
+                        await handle_commands(settings, runtime)
                     stage = "read telemetry"
                     telemetry = await runtime.read()
                     stage = "publish telemetry"
@@ -250,8 +316,7 @@ async def run_bridge(settings, runtime, stop, once=False):
                         finished = True
                         return
                     stage = "wait for next poll"
-                    delay = max(0, settings.poll_interval - runtime.elapsed(started))
-                    await runtime.sleep(delay, stop, monitor_probe=True)
+                    await wait_for_next_poll(settings, runtime, stop, started)
             except runtime.errors as exc:
                 if calibration is not None:
                     calibration.transport_failed(runtime, exc, stage)

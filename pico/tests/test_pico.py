@@ -156,14 +156,25 @@ class Socket:
             return None
         raise OSError("mock socket timeout")
 
+    def subscription_ack(self, data, pid=None, codes=None):
+        index = 1
+        while data[index] & 128:
+            index += 1
+        pid = data[index + 1:index + 3] if pid is None else pid
+        index += 3
+        count = 0
+        while index < len(data):
+            length = (data[index] << 8) | data[index + 1]
+            index += 3 + length
+            count += 1
+        codes = bytes((self.suback,)) * count if codes is None else bytes(codes)
+        return bytes((0x90, 2 + len(codes))) + pid + codes
+
     def write(self, data):
         data = bytes(data)
         self.writes.append(data)
         if data[0] == 0x82:
-            index = 1
-            while data[index] & 128:
-                index += 1
-            self.feed(b"\x90\x03" + data[index + 1:index + 3] + bytes((self.suback,)))
+            self.feed(self.subscription_ack(data))
         return len(data)
 
     def close(self):
@@ -338,7 +349,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.settings = Settings(
             username="reefpi", password="offline-test-placeholder",
             client_id="pico-unit-test", wifi_ssid="offline-test-ssid",
-            wifi_password="", mqtt_timeout=3.0,
+            wifi_password="", mqtt_timeout=3.0, address="88:56:A6:5B:03:56",
         )
         patches = [
             patch.dict(sys.modules, self.hardware.modules),
@@ -406,7 +417,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         initial = client.pings
         client.sock.feed(command(b"operator-command"))
         await self.runtime.prepare()
-        self.assertEqual(await self.runtime.commands(), [(b"operator-command", False)])
+        self.assertEqual(await self.runtime.commands(),
+                         [(self.settings.calibration_command_topic, b"operator-command", False)])
         self.assertEqual(client.pings, initial)
 
     async def test_closed_mqtt_socket_is_detected_before_heartbeat_is_due(self):
@@ -963,10 +975,13 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.publish("event", "{}", retain=False)
         self.assertEqual(self.hardware.clients[0].publications, [(b"event", b"{}", False, 0)])
 
-    async def test_disabled_commands_return_empty_without_mqtt_or_subscription(self):
-        self.assertEqual(await self.runtime.commands(), [])
+    async def test_read_only_commands_require_mqtt_and_do_not_subscribe_to_calibration(self):
+        with self.assertRaisesRegex(OSError, "MQTT unavailable"):
+            await self.runtime.commands()
         await self.runtime.prepare()
-        self.assertEqual(self.runtime.publisher.client.sock.writes, [])
+        self.assertEqual(self.runtime.publisher.command_topics,
+                         (self.settings.read_command_topic.encode(),))
+        self.assertEqual(len(self.runtime.publisher.client.sock.writes), 1)
         self.assertEqual(await self.runtime.commands(), [])
 
     async def test_commands_before_and_during_read_wait_for_controller(self):
@@ -986,7 +1001,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.runtime.read(), TELEMETRY)
         self.assertEqual(self.runtime.writer.writes, [pico_runtime.GET_TELEMETRY])
         self.assertEqual(await self.runtime.commands(),
-                         [(b"before-read", True), (b"during-read", False)])
+                         [(self.settings.calibration_command_topic, b"before-read", True),
+                          (self.settings.calibration_command_topic, b"during-read", False)])
         self.assertEqual(await self.runtime.commands(), [])
         self.assertEqual(self.runtime.writer.writes, [pico_runtime.GET_TELEMETRY])
         self.assertEqual(self.hardware.clients[0].publications, [])
@@ -1124,7 +1140,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(pico_runtime.asyncio, "sleep", virtual_sleep):
             await self.runtime.sleep(60, asyncio.Event())
         self.assertEqual(waits, [0.25])
-        self.assertEqual(await self.runtime.commands(), [(b"retained", True)])
+        self.assertEqual(await self.runtime.commands(),
+                         [(self.settings.calibration_command_topic, b"retained", True)])
         self.assertEqual(await self.runtime.commands(), [])
         self.assertEqual(self.hardware.connections, [])
         self.assertEqual(self.hardware.clients[0].publications, [])
@@ -1175,6 +1192,55 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ph["ts"], temperature["ts"])
         self.assertEqual(self.hardware.ntp_calls, 1)
         self.assertEqual(self.hardware.connections[0].disconnects, 1)
+
+    async def test_read_now_button_requests_fresh_values_without_calibration(self):
+        from test_pico_mqtt import command
+
+        self.runtime.led = None
+        stop = asyncio.Event()
+        real_sleep = asyncio.sleep
+        original_read = self.runtime.read
+        original_publish = self.runtime.publish
+        starts = []
+
+        async def virtual_sleep(seconds):
+            self.clock.advance(seconds)
+            if seconds > 0:
+                self.runtime.writer.packets = fragments(
+                    {**TELEMETRY, "value": 7.4, "temperature_value": 26.2},
+                )
+                self.runtime.publisher.client.sock.feed(
+                    command(b"READ", topic=self.settings.read_command_topic.encode()),
+                )
+            await real_sleep(0)
+
+        async def read():
+            starts.append(self.clock.value)
+            return await original_read()
+
+        async def publish(topic, payload, retain=True):
+            await original_publish(topic, payload, retain=retain)
+            if topic == self.settings.temperature_topic and len(starts) == 2:
+                stop.set()
+
+        with (
+            patch.object(pico_runtime.asyncio, "sleep", virtual_sleep),
+            patch.object(self.runtime, "read", side_effect=read),
+            patch.object(self.runtime, "publish", side_effect=publish),
+        ):
+            await reef_mqtt.run_bridge(self.settings, self.runtime, stop)
+        self.assertEqual(starts, [0, 250])
+        messages = self.hardware.clients[0].publications
+        ph = [json.loads(payload)["value"] for topic, payload, _, _ in messages
+              if topic.decode() == self.settings.ph_topic]
+        temperature = [json.loads(payload)["value"] for topic, payload, _, _ in messages
+                       if topic.decode() == self.settings.temperature_topic]
+        self.assertEqual(ph, [8.2, 7.4])
+        self.assertEqual(temperature, [25.4, 26.2])
+        self.assertEqual(self.hardware.connections[0].writer.writes,
+                         [pico_runtime.GET_TELEMETRY] * 2)
+        self.assertTrue(any(topic.endswith(b"/read_now/config") and retain
+                            for topic, _, retain, _ in messages))
 
     async def test_fatal_payload_error_leaves_pico_led_on_in_calibration_mode(self):
         self.settings.calibration_enabled = True

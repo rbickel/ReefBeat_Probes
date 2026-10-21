@@ -50,7 +50,8 @@ Optional `OVERRIDES` uses **canonical lower-case Settings field names**, such as
 `host`, `port`, `address`, `poll_interval`, `request_timeout`, `scan_timeout`,
 `mqtt_timeout`, `retry_min`, `retry_max`, `ntp_host`, `ph_topic`,
 `temperature_topic`, `availability_topic`, `temperature_sensor`, `wifi_timeout`,
-`wifi_disable_power_save`, `wifi_country`, and `status_led`.
+`wifi_disable_power_save`, `wifi_country`, `status_led`, `read_command_topic`,
+and `discovery_prefix`.
 Defaults live in the root module, not a duplicate Pico configuration class.
 The example uses the shared ten-second `mqtt_timeout`. An older board config
 may still override it with three seconds; changing the example on the computer
@@ -62,7 +63,8 @@ fix an unreliable WiFi link or unreachable broker.
 Keep `calibration_enabled=False` for ordinary telemetry. Only an explicit
 `OVERRIDES["calibration_enabled"] = True` permits the adapter to subscribe to
 `calibration_command_topic` at QoS 1 and send calibration POSTs. It subscribes to
-the exact topic, never a wildcard. The defaults are:
+the exact topic, never a wildcard. The independent read-only command subscription
+is always available and does not enable calibration. The defaults are:
 
 | Setting | Default |
 | --- | --- |
@@ -105,7 +107,26 @@ The original installation defaults are broker `192.168.50.177:1883`, probe
 Both payloads default to the `redsea_ph` sensor label;
 **the temperature comes from ReefSense, not a separate DS18B20**.
 Override `temperature_sensor` with `ds18b20` only if a legacy consumer needs it.
-There is no automatic HA discovery.
+Existing sensor entities are not automatically rediscovered or replaced.
+
+### Read now button in Home Assistant
+
+Continuous mode automatically discovers a **Read now** button on the **ReefSense
+probe** MQTT device, using `discovery_prefix="homeassistant"` by default.
+Press it to request fresh pH and temperature values without waiting for the next
+60-second poll. The Pico services requests during its 250 ms wait checks; the
+probe's BLE response time is additional. Normal polling continues afterward.
+
+The default `read_command_topic` is `reef/reef_probe/read/command`. Commands use
+the exact payload `READ`, QoS 1, and **retain=false**. Calibration remains disabled
+unless explicitly enabled; manual reads cannot bypass calibration/recovery or
+settling interlocks. Retained replays and invalid read payloads are logged and
+ignored.
+
+Update the board-root copies of [../reef_mqtt.py](../reef_mqtt.py),
+[pico_runtime.py](pico_runtime.py), and [pico_mqtt.py](pico_mqtt.py) together and
+restart the MicroPython backend, preserving `config.py` and credentials.
+See [Home Assistant setup and broker permissions](../README.md#read-now-from-home-assistant).
 
 ## Copy and install on the board
 
@@ -413,7 +434,9 @@ resubscription, partial cleanup, protocol rejection, queue overflow, timeouts,
 bounded WiFi/sleep/pings, stop responsiveness, NTP/epochs, retention selection,
 partial/interleaved MQTT packets, QoS/DUP/retain metadata, SUBACK errors, limits,
 restricted BLE operations, sequential MTU fragmentation, serialization and
-failed-stream poisoning. They also check the absence of callback-owned BLE
+failed-stream poisoning. Read-now tests verify exact-topic routing and multi-topic
+SUBACK validation, plus fresh readings after 250 ms of simulated waiting through
+the actual shared application. They also check the absence of callback-owned BLE
 operations and adapter-owned availability publication. Application-loop tests
 belong primarily to the root implementation; a bounded Pico integration test
 also runs the actual shared calibration loop from start through mid-point

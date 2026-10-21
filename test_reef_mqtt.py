@@ -113,7 +113,15 @@ class MqttTests(unittest.TestCase):
             )
             return mqtt.MQTT_ERR_SUCCESS
 
+        def subscribe(topics):
+            self.client.on_subscribe(
+                self.client, None, 1,
+                [Mock(is_failure=False, value=1) for _ in topics], None,
+            )
+            return mqtt.MQTT_ERR_SUCCESS, 1
+
         self.client.connect.side_effect = connect
+        self.client.subscribe.side_effect = subscribe
         self.factory = patch("reef_mqtt_linux.mqtt.Client", return_value=self.client)
         self.mock_factory = self.factory.start()
         self.addCleanup(self.factory.stop)
@@ -228,6 +236,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.stop = asyncio.Event()
         self.publisher = Mock(spec=bridge.Publisher)
         self.publisher.is_connected.return_value = True
+        self.publisher.commands.return_value = []
+        self.publisher.commands_pending.return_value = False
         self.runtime = bridge.Runtime(self.settings, self.publisher)
         self.device = BLEDevice(bridge.PROBE_ADDRESS, "RS_PH-test", None)
         self.client = Mock(spec=BleakClient)
@@ -374,6 +384,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         for name in ("prepare", "connect_probe", "publish", "close", "sleep", "indicate"):
             setattr(runtime, name, AsyncMock())
         runtime.read = AsyncMock(return_value=SAMPLE)
+        runtime.commands = AsyncMock(return_value=[])
         return runtime
 
     async def test_shared_once_publishes_only_received_values_and_availability(self):
@@ -402,6 +413,196 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         await app.run_bridge(app.Settings(poll_interval=60), runtime, stop)
         runtime.sleep.assert_awaited_once_with(58, stop, monitor_probe=True)
 
+    async def test_read_button_discovery_is_retained_and_does_not_replace_sensors(self):
+        runtime = self.runtime()
+        settings = app.Settings(
+            address="88:56:A6:5B:03:56", read_command_topic="test/read/command",
+            availability_topic="test/availability", discovery_prefix="test/discovery",
+        )
+        await app.publish_read_button(settings, runtime)
+        call = runtime.publish.await_args
+        self.assertEqual(
+            call.args[0], "test/discovery/button/reef_probe_8856a65b0356/read_now/config",
+        )
+        config = json.loads(call.args[1])
+        self.assertEqual(config["name"], "Read now")
+        self.assertEqual(config["command_topic"], settings.read_command_topic)
+        self.assertEqual(config["payload_press"], "READ")
+        self.assertEqual(config["availability_topic"], settings.availability_topic)
+        self.assertEqual(config["qos"], 1)
+        self.assertIs(config["retain"], False)
+        self.assertEqual(config["unique_id"], "reef_probe_8856a65b0356_read_now")
+        runtime.publish.assert_awaited_once()
+        self.assertEqual(call.kwargs, {"retain": True})
+        settings.client_id = "different-platform"
+        await app.publish_read_button(settings, runtime)
+        self.assertEqual(runtime.publish.await_args.args, call.args)
+
+    async def test_read_now_interrupts_sixty_second_poll_with_fresh_values(self):
+        for calibration_enabled in (False, True):
+            with self.subTest(calibration_enabled=calibration_enabled):
+                runtime = self.runtime()
+                settings = app.Settings(calibration_enabled=calibration_enabled)
+                stop = asyncio.Event()
+                now = 0.0
+                starts = []
+                pending = []
+
+                async def commands():
+                    result = list(pending)
+                    pending.clear()
+                    return result
+
+                async def read():
+                    starts.append(now)
+                    if len(starts) == 2:
+                        stop.set()
+                    return {**SAMPLE, "value": 7 + len(starts),
+                            "temperature_value": 24 + len(starts)}
+
+                async def sleep(seconds, _stop, monitor_probe=False):
+                    nonlocal now
+                    self.assertTrue(monitor_probe)
+                    now += 0.25
+                    pending.extend([(settings.read_command_topic, b"READ", False)] * 3)
+
+                runtime.ticks.side_effect = lambda: now
+                runtime.elapsed.side_effect = lambda started: now - started
+                runtime.epoch.return_value = 1800000000
+                runtime.commands.side_effect = commands
+                runtime.read.side_effect = read
+                runtime.sleep.side_effect = sleep
+                with patch("reef_calibration.PendingMarker") as marker:
+                    marker.return_value.exists.return_value = False
+                    await app.run_bridge(settings, runtime, stop)
+                self.assertEqual(starts, [0, 0.25])
+                ph = [json.loads(call.args[1])["value"]
+                      for call in runtime.publish.await_args_list
+                      if call.args[0] == settings.ph_topic]
+                temperature = [json.loads(call.args[1])["value"]
+                               for call in runtime.publish.await_args_list
+                               if call.args[0] == settings.temperature_topic]
+                self.assertEqual(ph, [8, 9])
+                self.assertEqual(temperature, [25, 26])
+                runtime.connect_probe.assert_awaited_once()
+
+    async def test_invalid_or_retained_read_requests_do_not_trigger_readings(self):
+        settings = app.Settings()
+        for payload, retained in ((b"READ", True), (b"", False), (b"read", False),
+                                  (b'{"action":"start"}', False)):
+            with self.subTest(payload=payload, retained=retained):
+                runtime = self.runtime()
+                runtime.commands.return_value = [
+                    (settings.read_command_topic, payload, retained),
+                ]
+                self.assertFalse(await app.handle_commands(settings, runtime))
+                runtime.report.assert_called()
+                runtime.read.assert_not_awaited()
+
+    async def test_read_requests_do_not_bypass_calibration_inhibition(self):
+        settings = app.Settings(calibration_enabled=True)
+        runtime = self.runtime()
+        runtime.commands.return_value = [(settings.read_command_topic, b"READ", False)]
+        calibration = Mock(inhibits_measurements=True)
+        self.assertFalse(await app.handle_commands(settings, runtime, calibration))
+        runtime.report.assert_called()
+        calibration.handle.assert_not_called()
+        runtime.read.assert_not_awaited()
+
+    async def test_command_wakeups_preserve_periodic_polling(self):
+        cases = (
+            (b"READ", False, [0, 0.25, 60.25], [60, 60]),
+            (b"READ", True, [0, 60], [60, 59.75]),
+            (b"invalid", False, [0, 60], [60, 59.75]),
+        )
+        for payload, retained, expected_starts, expected_waits in cases:
+            with self.subTest(payload=payload, retained=retained):
+                settings = app.Settings()
+                runtime = self.runtime()
+                stop = asyncio.Event()
+                now = 0.0
+                pending, starts, waits = [], [], []
+
+                async def commands():
+                    result = list(pending)
+                    pending.clear()
+                    return result
+
+                async def read():
+                    starts.append(now)
+                    if len(starts) == len(expected_starts):
+                        stop.set()
+                    return SAMPLE
+
+                async def sleep(seconds, _stop, monitor_probe=False):
+                    nonlocal now
+                    waits.append(seconds)
+                    if len(waits) == 1:
+                        now += 0.25
+                        pending.append((settings.read_command_topic, payload, retained))
+                    else:
+                        now += seconds
+
+                runtime.commands.side_effect = commands
+                runtime.read.side_effect = read
+                runtime.sleep.side_effect = sleep
+                runtime.ticks.side_effect = lambda: now
+                runtime.elapsed.side_effect = lambda started: now - started
+                await app.run_bridge(settings, runtime, stop)
+                self.assertEqual(starts, expected_starts)
+                self.assertEqual(waits, expected_waits)
+
+    async def test_read_request_during_ble_read_is_serialized_and_not_lost(self):
+        for calibration_enabled in (False, True):
+            with self.subTest(calibration_enabled=calibration_enabled):
+                settings = app.Settings(calibration_enabled=calibration_enabled)
+                runtime = self.runtime()
+                runtime.epoch.return_value = 1800000000
+                stop = asyncio.Event()
+                now = 0.0
+                starts, pending = [], []
+
+                async def commands():
+                    result = list(pending)
+                    pending.clear()
+                    return result
+
+                async def read():
+                    nonlocal now
+                    starts.append(now)
+                    if len(starts) == 1:
+                        pending.append((settings.read_command_topic, b"READ", False))
+                    else:
+                        stop.set()
+                    now += 0.05
+                    return SAMPLE
+
+                async def sleep(seconds, _stop, monitor_probe=False):
+                    nonlocal now
+                    now += seconds
+                    await asyncio.sleep(0)
+
+                runtime.commands.side_effect = commands
+                runtime.read.side_effect = read
+                runtime.sleep.side_effect = sleep
+                runtime.ticks.side_effect = lambda: now
+                runtime.elapsed.side_effect = lambda started: now - started
+                with patch("reef_calibration.PendingMarker") as marker:
+                    marker.return_value.exists.return_value = False
+                    await app.run_bridge(settings, runtime, stop)
+                self.assertEqual(starts, [0, 0.05])
+                self.assertEqual(runtime.read.await_count, 2)
+
+    async def test_read_and_discovery_topics_are_validated(self):
+        for overrides in (
+            {"read_command_topic": ""}, {"read_command_topic": "reef/+/command"},
+            {"read_command_topic": app.PH_TOPIC},
+            {"read_command_topic": app.Settings().calibration_command_topic},
+            {"discovery_prefix": ""}, {"discovery_prefix": "homeassistant/#"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                app.Settings(**overrides).validate(require_credentials=False)
+
     async def test_common_failure_does_not_publish_old_sample_or_online(self):
         runtime = self.runtime()
         runtime.publish.side_effect = [None, None, OSError("broker lost"), None, None]
@@ -425,8 +626,9 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         runtime.sleep.assert_not_awaited()
         self.assertEqual([call.args[0] for call in runtime.indicate.await_args_list],
                          ["initializing", "ok", "error"])
-        self.assertTrue(all(
-            call.args == (app.AVAILABILITY_TOPIC, "offline")
+        self.assertFalse(any(
+            call.args[0] in (app.PH_TOPIC, app.TEMPERATURE_TOPIC)
+            or call.args == (app.AVAILABILITY_TOPIC, "online")
             for call in runtime.publish.await_args_list
         ))
 

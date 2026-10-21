@@ -1183,7 +1183,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             else:
                 return []
             sent.add(state)
-            return [(json.dumps(data).encode(), False)]
+            return [(cfg.calibration_command_topic, json.dumps(data).encode(), False)]
 
         async def sleep(seconds, event, monitor_probe=False):
             runtime.now += seconds
@@ -1253,7 +1253,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             "action": "start", "command_id": "late-start", "boot_id": controller.boot_id,
             "nonce": controller.nonce, "expires_at": runtime.epoch() + 60,
         }).encode()
-        runtime.commands = AsyncMock(side_effect=[[], [(command, False)]])
+        runtime.commands = AsyncMock(side_effect=[[], [(cfg.calibration_command_topic, command, False)]])
 
         async def sleep(*args, **kwargs):
             stop.set()
@@ -1303,7 +1303,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 data.update(session_id=controller.session_id, confirm=True)
             sent_states.add(state)
             actions.append(data["action"])
-            return [(json.dumps(data).encode(), False)]
+            return [(cfg.calibration_command_topic, json.dumps(data).encode(), False)]
 
         async def publish(topic, payload, retain=True):
             if topic in (cfg.ph_topic, cfg.temperature_topic):

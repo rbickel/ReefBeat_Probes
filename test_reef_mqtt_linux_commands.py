@@ -1,4 +1,4 @@
-"""Linux calibration transport tests: all MQTT and BLE I/O is mocked."""
+"""Linux command transport tests: all MQTT and BLE I/O is mocked."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ class CommandPublisherTests(unittest.TestCase):
         self.subscribe_result = mqtt.MQTT_ERR_SUCCESS
         self.mid = 41
         self.ack_mid = 41
-        self.ack_codes = [1]
+        self.ack_codes = [1, 1]
         self.send_ack = True
         self.early_ack = False
         self.retained_delivery = False
@@ -58,9 +58,11 @@ class CommandPublisherTests(unittest.TestCase):
             self.acknowledge()
         return mqtt.MQTT_ERR_SUCCESS
 
-    def subscribe(self, topic: str, qos: int) -> tuple[int, int]:
-        self.assertEqual(topic, self.settings.calibration_command_topic)
-        self.assertEqual(qos, 1)
+    def subscribe(self, topics: list[tuple[str, int]]) -> tuple[int, int]:
+        expected = [(self.settings.read_command_topic, 1)]
+        if self.settings.calibration_enabled:
+            expected.append((self.settings.calibration_command_topic, 1))
+        self.assertEqual(topics, expected)
         if self.retained_delivery:
             self.deliver(b'{"action":"start"}', True)
         if self.early_ack:
@@ -81,19 +83,23 @@ class CommandPublisherTests(unittest.TestCase):
         message.retain = retain
         self.client.on_message(self.client, None, message)
 
-    def test_default_connect_does_not_subscribe(self) -> None:
+    def test_default_connect_subscribes_only_to_read_only_commands(self) -> None:
         self.settings.calibration_enabled = bridge.Settings().calibration_enabled
         self.assertFalse(self.settings.calibration_enabled)
+        self.ack_codes = [1]
         self.publisher.connect()
-        self.client.subscribe.assert_not_called()
+        self.client.subscribe.assert_called_once_with([(self.settings.read_command_topic, 1)])
         self.deliver(b"ignored")
         self.assertEqual(self.publisher.commands(), [])
+        self.deliver(b"READ", topic=self.settings.read_command_topic)
+        self.assertEqual(self.publisher.commands(),
+                         [(self.settings.read_command_topic, b"READ", False)])
         self.assertTrue(self.publisher.is_connected())
 
-    def test_opt_in_subscribes_only_exact_command_topic_at_qos_one(self) -> None:
+    def test_opt_in_subscribes_only_exact_read_and_calibration_topics_at_qos_one(self) -> None:
         self.publisher.connect()
         self.client.subscribe.assert_called_once_with(
-            self.settings.calibration_command_topic, qos=1,
+            [(self.settings.read_command_topic, 1), (self.settings.calibration_command_topic, 1)],
         )
         self.assertTrue(self.publisher.ready.is_set())
         self.client.publish.assert_not_called()
@@ -130,13 +136,13 @@ class CommandPublisherTests(unittest.TestCase):
         self.assertTrue(self.publisher.is_connected())
 
     def test_suback_failure_is_reported_and_not_ready(self) -> None:
-        self.ack_codes = [128]
+        self.ack_codes = [1, 128]
         with self.assertRaisesRegex(bridge.MqttError, "SUBACK"):
             self.publisher.connect()
         self.assertFalse(self.publisher.is_connected())
 
-    def test_suback_must_grant_one_qos_one_subscription(self) -> None:
-        for codes in ([], [0], [2], [1, 1]):
+    def test_suback_must_grant_all_requested_qos_one_subscriptions(self) -> None:
+        for codes in ([], [0], [1], [1, 0], [1, 2], [128, 1], [1, 1, 1]):
             with self.subTest(codes=codes):
                 self.ack_codes = codes
                 with self.assertRaisesRegex(bridge.MqttError, "SUBACK"):
@@ -179,7 +185,7 @@ class CommandPublisherTests(unittest.TestCase):
         def acknowledge_then_disconnect() -> None:
             self.publisher._on_subscribe(
                 self.client, None, self.mid,
-                [ReasonCode(PacketTypes.SUBACK, identifier=1)], None,
+                [ReasonCode(PacketTypes.SUBACK, identifier=1) for _ in range(2)], None,
             )
             self.publisher._on_disconnect(
                 self.client, None, Mock(), ReasonCode(PacketTypes.DISCONNECT, identifier=0), None,
@@ -197,7 +203,11 @@ class CommandPublisherTests(unittest.TestCase):
         self.deliver(payload, False)
         self.deliver(b"\xff", False)
         self.assertTrue(self.publisher.commands_pending())
-        self.assertEqual(self.publisher.commands(), [(payload, True), (payload, False), (b"\xff", False)])
+        self.assertEqual(self.publisher.commands(), [
+            (self.settings.calibration_command_topic, payload, True),
+            (self.settings.calibration_command_topic, payload, False),
+            (self.settings.calibration_command_topic, b"\xff", False),
+        ])
         self.assertFalse(self.publisher.commands_pending())
         self.assertEqual(self.publisher.commands(), [])
 
@@ -215,7 +225,8 @@ class CommandPublisherTests(unittest.TestCase):
         self.publisher.connect()
         payload = "\u00e9".encode() * 512
         self.deliver(payload)
-        self.assertEqual(self.publisher.commands(), [(payload, False)])
+        self.assertEqual(self.publisher.commands(),
+                         [(self.settings.calibration_command_topic, payload, False)])
         self.deliver(payload + b"x")
         self.assertTrue(self.publisher.commands_pending())
         with self.assertRaisesRegex(bridge.MqttError, "1024"):
@@ -228,7 +239,9 @@ class CommandPublisherTests(unittest.TestCase):
         expected = [(str(index).encode(), index % 2 == 0) for index in range(16)]
         for payload, retain in expected:
             self.deliver(payload, retain)
-        self.assertEqual(self.publisher.commands(), expected)
+        self.assertEqual(self.publisher.commands(),
+                         [(self.settings.calibration_command_topic, payload, retain)
+                          for payload, retain in expected])
 
     def test_overflow_is_latched_until_commands_surfaces_error(self) -> None:
         self.publisher.connect()
@@ -241,7 +254,8 @@ class CommandPublisherTests(unittest.TestCase):
         self.assertFalse(self.publisher.commands_pending())
         self.assertEqual(self.publisher.commands(), [])
         self.deliver(b"new")
-        self.assertEqual(self.publisher.commands(), [(b"new", False)])
+        self.assertEqual(self.publisher.commands(),
+                         [(self.settings.calibration_command_topic, b"new", False)])
 
     def test_concurrent_callbacks_preserve_queue_bound(self) -> None:
         self.publisher.connect()
@@ -261,7 +275,8 @@ class CommandPublisherTests(unittest.TestCase):
         self.publisher.ready.clear()
         self.retained_delivery = True
         self.publisher.connect()
-        self.assertEqual(self.publisher.commands(), [(b'{"action":"start"}', True)])
+        self.assertEqual(self.publisher.commands(),
+                         [(self.settings.calibration_command_topic, b'{"action":"start"}', True)])
         self.assertEqual(self.client.subscribe.call_count, 2)
 
     def test_reconnect_clears_callback_error_and_suback_state(self) -> None:
@@ -280,15 +295,18 @@ class CommandPublisherTests(unittest.TestCase):
         self.publisher.connect()
         self.deliver(b"pending", True)
         self.publisher.connect()
-        self.assertEqual(self.publisher.commands(), [(b"pending", True)])
+        self.assertEqual(self.publisher.commands(),
+                         [(self.settings.calibration_command_topic, b"pending", True)])
         self.client.subscribe.assert_called_once()
 
     def test_closed_client_callbacks_are_ignored(self) -> None:
         self.publisher.connect()
+        self.deliver(b"READ", topic=self.settings.read_command_topic)
         self.publisher.close()
         self.deliver(b"stale", True)
         self.acknowledge()
         self.assertEqual(self.publisher.commands(), [])
+        self.assertFalse(self.publisher.commands_pending())
         self.assertFalse(self.publisher.ready.is_set())
 
     def test_publication_preserves_requested_retention(self) -> None:
@@ -379,7 +397,8 @@ class CommandRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_commands_drain_on_worker_thread_and_preserve_metadata(self) -> None:
         caller = threading.get_ident()
-        commands = [(b"retained", True), (b"live", False)]
+        commands = [(self.settings.calibration_command_topic, b"retained", True),
+                    (self.settings.read_command_topic, b"READ", False)]
 
         def drain() -> bridge.Commands:
             self.assertNotEqual(threading.get_ident(), caller)
@@ -425,7 +444,9 @@ class CommandRuntimeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await operation
-        self.assertEqual(await self.runtime.commands(), expected)
+        self.assertEqual(await self.runtime.commands(),
+                         [(self.settings.calibration_command_topic, payload, retained)
+                          for payload, retained in expected])
         self.assertFalse(publisher.commands_pending())
 
     async def test_runtime_publication_forwards_retention(self) -> None:
@@ -449,6 +470,7 @@ class CommandRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wait.await_args.args[1], 0.25)
 
     async def test_command_arriving_during_real_sleep_wakes_early(self) -> None:
+        self.settings.calibration_enabled = False
         loop = asyncio.get_running_loop()
         handle = loop.call_later(0.01, setattr, self.publisher.commands_pending, "return_value", True)
         try:
@@ -468,13 +490,14 @@ class CommandRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.runtime.sleep(60, asyncio.Event(), monitor_probe=True), timeout=0.25,
             )
 
-    async def test_disabled_mode_retains_original_sleep_behavior(self) -> None:
+    async def test_read_only_mode_wakes_for_pending_commands(self) -> None:
         self.settings.calibration_enabled = False
+        self.publisher.commands_pending.return_value = True
         stop = asyncio.Event()
         with patch("reef_mqtt_linux.wait_or_stop", new=AsyncMock()) as wait:
             await self.runtime.sleep(60, stop)
-        wait.assert_awaited_once_with(stop, 60)
-        self.publisher.commands_pending.assert_not_called()
+        wait.assert_not_awaited()
+        self.publisher.commands_pending.assert_called_once()
 
     async def test_nonpositive_sleep_returns_immediately(self) -> None:
         with patch("reef_mqtt_linux.wait_or_stop", new=AsyncMock()) as wait:

@@ -372,6 +372,7 @@ class Runtime:
             self.publisher = Publisher(
                 client, cfg.availability_topic, cfg.mqtt_timeout, cfg.qos,
                 command_topic=cfg.calibration_command_topic if cfg.calibration_enabled is True else None,
+                read_command_topic=cfg.read_command_topic,
             )
             self.publisher.connect()
             self._last_ping = self.ticks()
@@ -496,8 +497,6 @@ class Runtime:
         self._check_mqtt()
 
     async def commands(self):
-        if self.settings.calibration_enabled is not True:
-            return []
         if not self.mqtt_connected():
             raise OSError("MQTT unavailable while receiving commands")
         return self.publisher.commands()
@@ -511,7 +510,7 @@ class Runtime:
                 raise ProbeConnectionError("BLE disconnected while waiting")
             if self.publisher is not None:
                 self._check_mqtt()
-                if self.settings.calibration_enabled and self.publisher.pending():
+                if self.publisher.pending():
                     return
             await asyncio.sleep(min(0.25, max(0, seconds - self.elapsed(start))))
 

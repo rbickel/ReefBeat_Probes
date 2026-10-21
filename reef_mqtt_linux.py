@@ -30,7 +30,7 @@ from reef_probe_protocol import GET, ProbeConnectionError
 
 LOG = logging.getLogger("reef_mqtt")
 Messages = list[tuple[str, dict[str, object]]]
-Commands = list[tuple[bytes, bool]]
+Commands = list[tuple[str, bytes, bool]]
 COMMAND_QUEUE_LIMIT = 16
 COMMAND_PAYLOAD_LIMIT = 1024
 COMMAND_WAKE_INTERVAL = 0.25
@@ -81,11 +81,17 @@ class MqttPublisher:
         self.acknowledged_mid: int | None = None
         self._command_lock = threading.Lock()
         self._command_pending = threading.Event()
-        self._commands: deque[tuple[bytes, bool]] = deque()
+        self._commands: deque[tuple[str, bytes, bool]] = deque()
         self._command_error: str | None = None
 
     def _accepts_commands(self) -> bool:
-        return self.settings.calibration_enabled and not self.check_only
+        return not self.check_only
+
+    def _command_topics(self) -> list[str]:
+        topics = [self.settings.read_command_topic]
+        if self.settings.calibration_enabled:
+            topics.append(self.settings.calibration_command_topic)
+        return topics
 
     def _on_connect(
         self, client: mqtt.Client, _userdata: object, _flags: mqtt.ConnectFlags,
@@ -98,7 +104,7 @@ class MqttPublisher:
         elif self._accepts_commands():
             try:
                 result, self.subscription_mid = client.subscribe(
-                    self.settings.calibration_command_topic, qos=1,
+                    [(topic, 1) for topic in self._command_topics()],
                 )
                 if result != mqtt.MQTT_ERR_SUCCESS:
                     self.connection_error = f"MQTT subscribe failed: {mqtt.error_string(result)}"
@@ -115,7 +121,9 @@ class MqttPublisher:
         if client is not self.client or not self._accepts_commands():
             return
         self.acknowledged_mid = mid
-        if len(reasons) != 1 or reasons[0].is_failure or reasons[0].value != 1:
+        if len(reasons) != len(self._command_topics()) or any(
+            reason.is_failure or reason.value != 1 for reason in reasons
+        ):
             self.subscription_error = "MQTT SUBACK did not grant the required command QoS 1"
         self.suback.set()
 
@@ -124,18 +132,18 @@ class MqttPublisher:
     ) -> None:
         if (
             client is not self.client or not self._accepts_commands()
-            or message.topic != self.settings.calibration_command_topic
+            or message.topic not in self._command_topics()
         ):
             return
         with self._command_lock:
             if self._command_error is not None:
                 return
             if len(message.payload) > COMMAND_PAYLOAD_LIMIT:
-                self._command_error = "Calibration command exceeds 1024-byte payload limit"
+                self._command_error = "MQTT command exceeds 1024-byte payload limit"
             elif len(self._commands) >= COMMAND_QUEUE_LIMIT:
-                self._command_error = "Calibration command queue overflow; commands discarded"
+                self._command_error = "MQTT command queue overflow; commands discarded"
             else:
-                self._commands.append((bytes(message.payload), message.retain))
+                self._commands.append((message.topic, bytes(message.payload), message.retain))
             self._command_pending.set()
 
     def commands(self) -> Commands:
@@ -242,6 +250,10 @@ class MqttPublisher:
     def close(self) -> None:
         client, self.client = self.client, None
         self.ready.clear()
+        with self._command_lock:
+            self._commands.clear()
+            self._command_error = None
+            self._command_pending.clear()
         if client is not None:
             try:
                 client.disconnect()
@@ -347,14 +359,14 @@ class Runtime:
         async def wait_for_commands() -> None:
             deadline = self.ticks() + seconds
             while not stop.is_set():
-                if self.settings.calibration_enabled and self.publisher.commands_pending():
+                if self.publisher.commands_pending():
                     return
                 remaining = deadline - self.ticks()
                 if remaining <= 0:
                     return
                 await wait_or_stop(stop, min(remaining, COMMAND_WAKE_INTERVAL))
 
-        wait = wait_for_commands() if self.settings.calibration_enabled else wait_or_stop(stop, seconds)
+        wait = wait_for_commands()
         if monitor_probe and self.probe is not None:
             await self.probe.guard(wait)
         else:
