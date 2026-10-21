@@ -74,7 +74,7 @@ class PayloadTests(unittest.TestCase):
     def test_default_interval_and_hidden_password(self):
         settings = bridge.Settings(username="test", password="not-a-real-secret")
         settings.validate()
-        self.assertEqual(settings.poll_interval, 60)
+        self.assertEqual(settings.poll_interval, 300)
         self.assertNotIn(settings.password, repr(settings))
         for field, value in (
             ("poll_interval", 0), ("poll_interval", float("nan")), ("qos", 2),
@@ -349,6 +349,16 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_reading_interval_defaults_to_five_minutes_and_can_be_overridden(self):
+        for args, expected in (([], 300), (["--interval", "600"], 600)):
+            with (
+                self.subTest(args=args),
+                patch.dict(os.environ, {"MQTT_USERNAME": "test", "MQTT_PASSWORD": "unused"}, clear=True),
+                patch("reef_mqtt_linux.run", new_callable=AsyncMock) as run,
+            ):
+                self.assertEqual(bridge.main(args), 0)
+                self.assertEqual(run.call_args.args[0].poll_interval, expected)
+
     def test_discovery_is_enabled_by_default_with_an_explicit_opt_out(self):
         for args, enabled in (([], True), (["--no-discovery"], False)):
             with (
@@ -473,7 +483,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(configs[key]["unit_of_measurement"], "mV")
         for key in ("ph", "temperature", "ph_voltage", "temperature_voltage"):
             self.assertEqual(configs[key]["state_class"], "measurement")
-            self.assertEqual(configs[key]["expire_after"], 180)
+            self.assertEqual(configs[key]["expire_after"], 900)
         for key in ("ph_voltage", "temperature_voltage", "probe_status",
                     "last_reading", "calibration_status"):
             self.assertEqual(configs[key]["entity_category"], "diagnostic")
@@ -557,7 +567,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
                     await app.publish_sample(app.Settings(), runtime, {**SAMPLE, **overrides})
                 runtime.publish.assert_not_awaited()
 
-    async def test_read_now_interrupts_sixty_second_poll_with_fresh_values(self):
+    async def test_read_now_interrupts_five_minute_poll_with_fresh_values(self):
         for calibration_enabled, discovery_enabled in ((False, False), (False, True), (True, True)):
             with self.subTest(calibration_enabled=calibration_enabled,
                               discovery_enabled=discovery_enabled):
@@ -584,6 +594,8 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
                 async def sleep(seconds, _stop, monitor_probe=False):
                     nonlocal now
                     self.assertTrue(monitor_probe)
+                    if not calibration_enabled:
+                        self.assertEqual(seconds, 300)
                     now += 0.25
                     pending.extend([(settings.read_command_topic, b"READ", False)] * 3)
 
@@ -632,9 +644,9 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_command_wakeups_preserve_periodic_polling(self):
         cases = (
-            (b"READ", False, [0, 0.25, 60.25], [60, 60]),
-            (b"READ", True, [0, 60], [60, 59.75]),
-            (b"invalid", False, [0, 60], [60, 59.75]),
+            (b"READ", False, [0, 0.25, 300.25], [300, 300]),
+            (b"READ", True, [0, 300], [300, 299.75]),
+            (b"invalid", False, [0, 300], [300, 299.75]),
         )
         for payload, retained, expected_starts, expected_waits in cases:
             with self.subTest(payload=payload, retained=retained):
@@ -859,7 +871,7 @@ class SharedApplicationTests(unittest.IsolatedAsyncioTestCase):
         settings = app.Settings()
         self.assertEqual(settings.username, "")
         self.assertEqual(settings.password, "")
-        self.assertEqual(settings.poll_interval, 60)
+        self.assertEqual(settings.poll_interval, 300)
         with self.assertRaises(ValueError):
             app.Settings(typo_interval=60)
 

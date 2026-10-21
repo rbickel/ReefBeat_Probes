@@ -55,6 +55,12 @@ Optional `OVERRIDES` uses **canonical lower-case Settings field names**, such as
 Most defaults live in the root module, not a duplicate Pico configuration class.
 The Pico entrypoint enables `temperature_calibration_enabled` by default while
 respecting an explicit override; Linux keeps temperature calibration opt-in.
+Normal readings default to **300 seconds (five minutes)**. Configure the period
+with `OVERRIDES["poll_interval"] = 300.0`, or another finite positive number of
+seconds. Read now still requests an immediate reading, and calibration timing
+is separate. Discovered measurement entities automatically use three polling
+intervals for expiry, with a minimum of 180 seconds (900 seconds at the default).
+Changing the bridge interval does not configure the probe's internal sample rate.
 The example uses the shared ten-second `mqtt_timeout`. An older board config
 may still override it with three seconds; changing the example on the computer
 does not update the board. Ten seconds allows more network latency, but cannot
@@ -155,7 +161,7 @@ diagnostic records. See [complete discovery behavior](../README.md#automatic-hom
 ### Read now button in Home Assistant
 
 Press the discovered **Read now** button to request fresh pH and temperature
-values without waiting for the next 60-second poll. The Pico services requests during its 250 ms wait checks; the
+values without waiting for the next 300-second poll. The Pico services requests during its 250 ms wait checks; the
 probe's BLE response time is additional. Normal polling continues afterward.
 
 The default `read_command_topic` is `reef/reef_probe/read/command`. Commands use

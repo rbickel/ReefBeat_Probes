@@ -314,6 +314,28 @@ class TemperatureCalibrationTests(unittest.IsolatedAsyncioTestCase):
                         if topic == self.settings.temperature_topic]
         self.assertAlmostEqual(temperatures[0], 25.6)
 
+    async def test_idle_temperature_monitoring_reads_only_every_five_minutes(self):
+        self.runtime.prepare = AsyncMock()
+        self.runtime.commands = AsyncMock(return_value=[])
+        stop = asyncio.Event()
+        starts = []
+
+        async def read():
+            starts.append(self.runtime.now)
+            if len(starts) == 2:
+                stop.set()
+            return dict(self.runtime.telemetry)
+
+        async def sleep(seconds, _stop, monitor_probe=False):
+            self.runtime.now += seconds
+            await asyncio.sleep(0)
+
+        self.runtime.read = AsyncMock(side_effect=read)
+        self.runtime.sleep = sleep
+        await reef_mqtt.calibration_loop(self.settings, self.runtime, stop, self.controller)
+        self.assertEqual(starts, [0, 300])
+        self.assertEqual([path for path, _, _ in self.runtime.calls], ["/config"])
+
 
 class TemperatureDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_temperature_opt_in_requires_a_boolean(self):

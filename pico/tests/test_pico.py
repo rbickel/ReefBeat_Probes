@@ -1705,6 +1705,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(settings.wifi_ssid, local_config.WIFI_SSID)
         self.assertEqual(settings.username, local_config.MQTT_USERNAME)
         self.assertEqual(settings.mqtt_timeout, 3.0)
+        self.assertEqual(settings.poll_interval, 300)
         self.assertFalse(settings.discovery_enabled)
         self.assertTrue(settings.temperature_calibration_enabled)
         self.assertFalse(settings.calibration_enabled)
@@ -1723,7 +1724,7 @@ class DriverTests(unittest.TestCase):
                     WIFI_SSID="offline-test-ssid", WIFI_PASSWORD="",
                     MQTT_USERNAME="reefpi", MQTT_PASSWORD="offline-test-placeholder",
                     MQTT_CLIENT_ID="pico-unit-test",
-                    OVERRIDES={"temperature_calibration_enabled": enabled},
+                    OVERRIDES={"temperature_calibration_enabled": enabled, "poll_interval": 45.0},
                 )
                 runtime_factory = Mock()
                 with (
@@ -1734,6 +1735,7 @@ class DriverTests(unittest.TestCase):
                     pico_runtime.main()
                 settings = runtime_factory.call_args.args[0]
                 self.assertIs(settings.temperature_calibration_enabled, enabled)
+                self.assertEqual(settings.poll_interval, 45.0)
                 self.assertFalse(settings.calibration_enabled)
                 self.assertEqual(len(list(reef_mqtt.discovery_messages(settings))),
                                  10 if enabled else 8)

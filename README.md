@@ -43,9 +43,13 @@ Run [reef_mqtt.py](reef_mqtt.py) on Raspberry Pi OS **Bookworm or newer
 Create a new venv on the Pi with the setup commands above rather than copying
 this computer's venv.
 
-At the top of the shared publisher, `POLL_INTERVAL_SECONDS = 60.0` controls the period.
-The probe stays connected between requests; normal sampling is approximately
-start-to-start every minute. `--interval 30` temporarily overrides it.
+At the top of the shared publisher, `POLL_INTERVAL_SECONDS = 300.0` sets the
+default period to five minutes. The probe stays connected between requests;
+normal polling is approximately start-to-start every 300 seconds. On Linux,
+`--interval 600` overrides it; on Pico, set `OVERRIDES["poll_interval"] = 600.0`
+in local configuration. The interval must be finite and positive. This controls
+how often the bridge requests data, not a device-internal measurement-rate setting.
+Read now remains immediate, and active calibration keeps its separate timing.
 Failures use bounded exponential reconnect backoff (5 to 60 seconds).
 Successful samples or calibration/monitoring service cycles reset this delay.
 The MQTT background network loop services keepalives even during long intervals.
@@ -177,7 +181,7 @@ Pressing it requests a **fresh BLE reading of both pH and temperature** and
 publishes the results to the existing state topics. Command processing wakes
 within approximately 250 ms while the bridge is waiting; the actual reading
 still takes the probe's BLE response time. It does not replay cached values.
-Normal 60-second start-to-start polling continues from the requested reading.
+Normal 300-second start-to-start polling continues from the requested reading.
 Multiple presses queued together are coalesced into one request, and requests
 received during an in-flight read run afterward, never concurrently.
 
@@ -323,7 +327,7 @@ and `value_template: "{{ value_json.value }}"`, and add the equivalent of:
 availability_topic: reef/reef_probe/availability
 payload_available: online
 payload_not_available: offline
-expire_after: 180
+expire_after: 900
 ```
 
 Adjust `expire_after` if you increase the polling interval. Without availability/
@@ -353,7 +357,7 @@ sudo systemctl stop reef-mqtt.service
 
 The service was not installed or started on this development computer. Ordinary
 operation logs to stdout/stderr (journald with systemd) rather than writing raw
-packet files every minute. Use `--debug` to include BLE traffic when investigating.
+packet files every poll. Use `--debug` to include BLE traffic when investigating.
 
 ### Publisher verification
 

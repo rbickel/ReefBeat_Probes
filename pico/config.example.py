@@ -8,6 +8,7 @@ MQTT_CLIENT_ID = "reef-probe-pico-w-unique-name"  # Change; never reuse the Pi3 
 # Optional canonical Settings overrides; most defaults live in reef_mqtt.py.
 OVERRIDES = {
     "mqtt_timeout": 10.0,
+    "poll_interval": 300.0,
     "discovery_enabled": True,
     "calibration_enabled": False,  # Explicit opt-in required; never enable just to test transport.
     "temperature_calibration_enabled": True,  # Control enabled; firmware writes still require a manual request.
@@ -28,7 +29,6 @@ OVERRIDES = {
     # "wifi_country": "",  # Your actual two-letter country code; empty keeps firmware default.
     # "status_led": True,  # Fast=start/reconnect, slow=error, heartbeat=healthy.
     # "host": "192.168.50.177",
-    # "poll_interval": 60.0,
     # "read_command_topic": "reef/reef_probe/read/command",
     # "discovery_prefix": "homeassistant",
     # "temperature_sensor": "redsea_ph",  # Use ds18b20 only for legacy consumers.
