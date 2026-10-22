@@ -45,7 +45,8 @@ this computer's venv.
 
 At the top of the shared publisher, `POLL_INTERVAL_SECONDS = 300.0` sets the
 default period to five minutes. The probe stays connected between requests;
-normal polling is approximately start-to-start every 300 seconds. On Linux,
+normal polling is approximately start-to-start every 300 seconds. Pico automatic
+mode cycles BLE connections across discovered probes. On Linux,
 `--interval 600` overrides it; on Pico, set `OVERRIDES["poll_interval"] = 600.0`
 in local configuration. The interval must be finite and positive. This controls
 how often the bridge requests data, not a device-internal measurement-rate setting.
@@ -109,8 +110,9 @@ or publicly share `.env`.
 
 ### Automatic Home Assistant discovery
 
-After deploying the updated bridge and restarting it, Home Assistant's MQTT
-integration automatically discovers one **ReefSense probe** device containing:
+In single-probe/fixed-address mode, Home Assistant's MQTT integration discovers
+one **ReefSense probe** device containing the entities below. Pico's default
+automatic Bluetooth mode creates a bridge device plus one device per probe.
 
 | Entity | Type | Source |
 |---|---|---|
@@ -172,6 +174,39 @@ publish those topics and Home Assistant to receive them. If you previously
 created manual MQTT entities, disable or remove their definitions before using
 the new discovered entities to avoid duplicate sensors/devices.
 
+### Automatic Bluetooth discovery on Pico W
+
+Pico W now defaults to automatic ReefSense discovery, rather than requiring a
+Bluetooth MAC in configuration. It scans at startup and exposes a **Scan for
+probes** Home Assistant button on a bridge device. MQTT clients can also publish
+`SCAN` with QoS 1 and retain=false to `reef/reef_probe/scan/command`.
+
+Every physical probe gets a stable identity, separate Home Assistant device,
+unique topics under `reef/probes/<id>/`, and independent availability and command
+state. Multiple probes of the same type and name are supported. pH, ORP,
+salinity/conductivity/specific-gravity, and standalone-temperature profiles use
+their own validated telemetry fields; ORP/salinity calibration is not enabled by
+the pH permissions.
+
+Stock Pico W MicroPython is configured for one BLE connection, so the portable
+supervisor polls probes round-robin while keeping one shared MQTT connection.
+It pins the connection during calibration and temporarily pauses other probes
+and new scans, as opposed to attempting unsupported simultaneous connections.
+Normal per-probe polling defaults to 300 seconds and remains configurable.
+
+The persistent `probes.json` inventory keeps the primary pH identity stable.
+That previous probe alone retains compatibility aliases on the existing pH,
+temperature, calibration, diagnostic, and availability topics. It does not
+silently substitute another pH probe if the original is absent. Discovered
+entities additionally use `reef/reef_bridge/availability` for the shared last
+will; legacy manual consumers should honor that topic or the configured expiry.
+
+**Physical multi-probe/Pico operation and ORP/salinity accuracy are unverified.**
+The implementation is grounded in app schemas and scripted tests, including
+duplicate-type devices. Keep ReefBeat and other publishers disconnected.
+See the [Pico configuration, complete deployment file list, topic map, and
+limitations](pico/README.md#automatic-bluetooth-discovery-and-multiple-probes).
+
 ### Read now from Home Assistant
 
 Add the discovered **Read now** button to a dashboard for convenient testing;
@@ -181,6 +216,8 @@ Pressing it requests a **fresh BLE reading of both pH and temperature** and
 publishes the results to the existing state topics. Command processing wakes
 within approximately 250 ms while the bridge is waiting; the actual reading
 still takes the probe's BLE response time. It does not replay cached values.
+Automatic mode may also need BLE reconnection; a request is prioritized without
+waiting 300 seconds, unless a scan or another probe's calibration is in progress.
 Normal 300-second start-to-start polling continues from the requested reading.
 Multiple presses queued together are coalesced into one request, and requests
 received during an in-flight read run afterward, never concurrently.
@@ -310,10 +347,12 @@ controls should disappear.
 
 ### Availability and stale readings
 
-The bridge publishes retained `online` / `offline` on
+In single-probe mode the bridge publishes retained `online` / `offline` on
 `reef/reef_probe/availability`. `online` is sent only after both healthy state
 messages have been sent. A retained `offline` last will covers unexpected MQTT
 connection loss; clean shutdown or BLE failures also mark offline when possible.
+Automatic multi-probe mode uses per-device availability plus a shared bridge
+last will, as described above; the primary compatibility topic is still mirrored.
 Malformed/non-finite telemetry, non-`connected` sensor status, or an unsynchronized
 clock are **not** replaced with zeros or prior measurements. On recovery the
 bridge fetches a fresh reading instead of replaying its old sample.
@@ -394,6 +433,10 @@ It uses one [payload formatter](reef_mqtt_payload.py) and one
 [wire protocol implementation](reef_probe_protocol.py), shared with the standalone
 diagnostic CLI. MQTT calibration policy lives in one
 [shared controller](reef_calibration.py), not separate Linux/Pico workflows.
+The portable [multi-probe supervisor](reef_mqtt_multi.py) adds inventory and
+round-robin scheduling, and [probe profiles](reef_probe_profiles.py) distinguish
+the types. Pico automatic mode selects this supervisor through the same canonical
+entrypoint; Linux CLI and fixed-address mode keep their existing single-probe path.
 Do not maintain separate Linux/Pico copies of this application.
 
 The hardware interfaces remain platform-specific:
@@ -1303,7 +1346,7 @@ Run the application/driver tests as well:
 ```bash
 .venv/bin/python -m pip install -r requirements-test.txt
 .venv/bin/python -B -m unittest -v test_reef_mqtt test_reef_probe \
-  test_reef_calibration test_reef_mqtt_linux_commands test_reef_temperature
+  test_reef_calibration test_reef_mqtt_linux_commands test_reef_temperature test_reef_multi
 ```
 
 `requirements-test.txt` adds a test-only Jinja2 renderer so discovery command
@@ -1341,6 +1384,9 @@ Temperature-calibration tests cover positive/negative corrections, the exact
 factory/pH-field preservation, timestamp/read-back failures, lost acknowledgements,
 duplicate/replayed commands, compensation settling, device-offset reads after
 restart, and the discovered number control through scripted Pico MQTT/BLE.
+Run `test_reef_multi` for automatic inventory, per-device routing, aliases and
+round-robin tests; the Pico suite additionally covers scanning, incremental exact
+subscriptions and cycling multiple physical identities through one transport.
 Validation for the MQTT calibration implementation: **244 offline tests passed**
 (158 shared/Linux/diagnostic tests and 86 Pico tests), including the actual shared
 calibration controller driven through the mocked Pico MQTT/BLE transport.

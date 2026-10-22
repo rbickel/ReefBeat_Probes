@@ -23,8 +23,9 @@ MQTT_QOS = 0
 
 
 class Settings:
-    def __init__(self, **overrides):
-        defaults = {
+    @staticmethod
+    def defaults():
+        return {
             "poll_interval": POLL_INTERVAL_SECONDS, "address": PROBE_ADDRESS,
             "host": MQTT_HOST, "port": MQTT_PORT, "username": "", "password": "",
             "client_id": "reef-probe", "ph_topic": PH_TOPIC,
@@ -50,13 +51,27 @@ class Settings:
             "calibration_settle_seconds": 30.0,
             "calibration_reconnect_timeout": 60.0,
             "calibration_marker_path": "calibration.pending",
+            "probe_discovery_enabled": False, "max_probes": 8,
+            "probe_topic_prefix": "reef/probes",
+            "probe_scan_command_topic": "reef/reef_probe/scan/command",
+            "probe_scan_state_topic": "reef/reef_probe/scan/state",
+            "bridge_availability_topic": "reef/reef_bridge/availability",
+            "probe_registry_path": "probes.json",
         }
+
+    def __init__(self, **overrides):
+        defaults = self.defaults()
         for key in overrides:
             if key not in defaults:
                 raise ValueError("Unknown setting: " + key)
         defaults.update(overrides)
         for key, value in defaults.items():
             setattr(self, key, value)
+
+    def copy(self, **overrides):
+        values = {key: getattr(self, key) for key in self.defaults()}
+        values.update(overrides)
+        return Settings(**values)
 
     def validate(self, require_credentials=True):
         for key in (
@@ -75,9 +90,11 @@ class Settings:
         if self.retry_max < self.retry_min:
             raise ValueError("retry_max must be >= retry_min")
         for key in ("wifi_disable_power_save", "status_led", "calibration_enabled",
-                    "temperature_calibration_enabled", "discovery_enabled"):
+                    "temperature_calibration_enabled", "discovery_enabled", "probe_discovery_enabled"):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(key + " must be a boolean")
+        if isinstance(self.max_probes, bool) or not isinstance(self.max_probes, int) or not 1 <= self.max_probes <= 8:
+            raise ValueError("max_probes must be an integer from 1 to 8")
         if not isinstance(self.wifi_country, str) or (
             self.wifi_country and (
                 len(self.wifi_country) != 2
@@ -103,7 +120,8 @@ class Settings:
             raise ValueError("Availability topic must not overwrite a sensor state")
         validate_topics(self.ph_topic, self.temperature_topic, self.temperature_sensor)
         topics = [self.ph_topic, self.temperature_topic, self.availability_topic]
-        for key in ("read_command_topic", "discovery_prefix",
+        for key in ("read_command_topic", "discovery_prefix", "probe_topic_prefix",
+                    "probe_scan_command_topic", "probe_scan_state_topic", "bridge_availability_topic",
                     "calibration_command_topic", "calibration_state_topic", "calibration_event_topic",
                     "calibration_failure_topic", "probe_diagnostics_topic"):
             topic = getattr(self, key)
@@ -123,6 +141,10 @@ class Settings:
                 raise ValueError("Diagnostic topic trees must not overlap other topics")
         if not isinstance(self.calibration_marker_path, str) or not self.calibration_marker_path:
             raise ValueError("calibration_marker_path must be nonempty")
+        if not isinstance(self.probe_registry_path, str) or not self.probe_registry_path:
+            raise ValueError("probe_registry_path must be nonempty")
+        if self.probe_registry_path == self.calibration_marker_path:
+            raise ValueError("Probe registry must not overwrite a calibration marker")
         if require_credentials and (not self.username or not self.password):
             raise ValueError("Set MQTT_USERNAME and MQTT_PASSWORD in the environment or Pico config")
 
@@ -255,19 +277,25 @@ def discovery_messages(settings):
         yield settings.discovery_prefix + "/" + component + "/" + identifier + "/" + key + "/config", config
 
 
+def temperature_command_template(settings, calibration):
+    if calibration is None:
+        raise ValueError("Temperature calibration discovery requires a replay-protection controller.")
+    return (
+        '{"action":"temperature_reference","boot_id":%s,"nonce":%s,'
+        '"reference_c":{{ value | float }},"confirm":true,'
+        '"command_id":"temp-{{ now().strftime(\'%%Y%%m%%d%%H%%M%%S%%f\') }}",'
+        '"expires_at":{{ (as_timestamp(now()) | int) + %d }}}'
+    ) % (json.dumps(calibration.boot_id), json.dumps(calibration.nonce),
+         int(settings.calibration_command_ttl))
+
+
 async def publish_discovery(settings, runtime, calibration=None):
     if settings.discovery_enabled:
         if settings.temperature_calibration_enabled and calibration is None:
             raise ValueError("Temperature calibration discovery requires a replay-protection controller.")
         for topic, config in discovery_messages(settings):
             if topic.endswith("/temperature_calibration/config"):
-                config["command_template"] = (
-                    '{"action":"temperature_reference","boot_id":%s,"nonce":%s,'
-                    '"reference_c":{{ value | float }},"confirm":true,'
-                    '"command_id":"temp-{{ now().strftime(\'%%Y%%m%%d%%H%%M%%S%%f\') }}",'
-                    '"expires_at":{{ (as_timestamp(now()) | int) + %d }}}'
-                ) % (json.dumps(calibration.boot_id), json.dumps(calibration.nonce),
-                     int(settings.calibration_command_ttl))
+                config["command_template"] = temperature_command_template(settings, calibration)
             await runtime.publish(topic, json.dumps(config), retain=True)
 
 
@@ -352,6 +380,11 @@ async def calibration_loop(settings, runtime, stop, calibration, on_success=None
 
 async def run_bridge(settings, runtime, stop, once=False):
     """Run until stopped, retrying transport failures without an attempt limit."""
+    if settings.probe_discovery_enabled:
+        if once:
+            raise ValueError("Automatic probe discovery requires continuous operation")
+        from reef_mqtt_multi import run_multi_bridge
+        return await run_multi_bridge(settings, runtime, stop)
     retry = settings.retry_min
     from reef_calibration import Calibration, PendingMarker
     marker = PendingMarker(settings.calibration_marker_path)

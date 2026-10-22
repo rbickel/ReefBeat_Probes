@@ -13,6 +13,11 @@ def validate_topics(ph_topic, temperature_topic, temperature_sensor):
         raise ValueError("pH and temperature topics must differ")
 
 
+def validate_timestamp(timestamp):
+    if not isinstance(timestamp, str) or len(timestamp) != 20 or not timestamp.endswith("Z"):
+        raise ValueError("Timestamp must be UTC YYYY-MM-DDTHH:MM:SSZ")
+
+
 def state_messages(
     telemetry, timestamp,
     ph_topic="reef/sump_ph/state",
@@ -28,8 +33,7 @@ def state_messages(
             raise ValueError("Telemetry %s must be numeric" % key)
         if not math.isfinite(value):
             raise ValueError("Telemetry %s must be finite" % key)
-    if not isinstance(timestamp, str) or len(timestamp) != 20 or not timestamp.endswith("Z"):
-        raise ValueError("Timestamp must be UTC YYYY-MM-DDTHH:MM:SSZ")
+    validate_timestamp(timestamp)
     validate_topics(ph_topic, temperature_topic, temperature_sensor)
     return [
         (ph_topic, {

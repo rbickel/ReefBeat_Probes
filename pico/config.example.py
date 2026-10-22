@@ -10,6 +10,7 @@ OVERRIDES = {
     "mqtt_timeout": 10.0,
     "poll_interval": 300.0,
     "discovery_enabled": True,
+    "probe_discovery_enabled": True,
     "calibration_enabled": False,  # Explicit opt-in required; never enable just to test transport.
     "temperature_calibration_enabled": True,  # Control enabled; firmware writes still require a manual request.
     # "calibration_command_topic": "reef/sump_ph/calibration/command",  # Exact topic, no wildcards.
@@ -17,6 +18,11 @@ OVERRIDES = {
     # "calibration_event_topic": "reef/sump_ph/calibration/event",
     # "calibration_failure_topic": "reef/sump_ph/calibration/failure",
     # "probe_diagnostics_topic": "reef/reef_probe/diagnostics",
+    # "max_probes": 8,
+    # "probe_scan_command_topic": "reef/reef_probe/scan/command",
+    # "probe_scan_state_topic": "reef/reef_probe/scan/state",
+    # "probe_registry_path": "probes.json",
+    # "probe_topic_prefix": "reef/probes",
     # "calibration_timeout": 420,  # Single point deadline, including firmware countdown margin.
     # "calibration_wait_timeout": 900,  # Operator wait deadline.
     # "calibration_poll_interval": 3,

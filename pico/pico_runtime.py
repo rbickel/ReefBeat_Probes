@@ -6,6 +6,7 @@ from collections import deque
 
 from pico_mqtt import Publisher
 from reef_mqtt import describe_error
+from reef_probe_profiles import advertised_type, probe_description
 from reef_probe_protocol import (
     ACK, GET, POST, REST, SERVICE_UUID, WRITE_UUID, NOTIFY_UUID, ProbeError, ProbeRejected,
     ProbeConnectionError,
@@ -126,6 +127,13 @@ class Runtime:
         if self.keepalive > 65535:
             raise ValueError("Pico timeouts exceed the MQTT keepalive budget")
         self.settings = settings
+        self._address_type = aioble.ADDR_PUBLIC
+        self._command_topics = [settings.read_command_topic]
+        if settings.calibration_enabled or settings.temperature_calibration_enabled:
+            self._command_topics.append(settings.calibration_command_topic)
+        if settings.probe_discovery_enabled:
+            self._command_topics.append(settings.probe_scan_command_topic)
+        self._custom_command_topics = False
         self.aioble = aioble
         self.bluetooth = bluetooth
         self.network = network
@@ -370,12 +378,20 @@ class Runtime:
                 user=cfg.username.encode("utf-8") if cfg.username else None,
                 password=cfg.password.encode("utf-8"), keepalive=self.keepalive,
             )
+            if not self._custom_command_topics:
+                self._command_topics = [cfg.read_command_topic]
+                if cfg.calibration_enabled or cfg.temperature_calibration_enabled:
+                    self._command_topics.append(cfg.calibration_command_topic)
+                if cfg.probe_discovery_enabled:
+                    self._command_topics.append(cfg.probe_scan_command_topic)
             self.publisher = Publisher(
-                client, cfg.availability_topic, cfg.mqtt_timeout, cfg.qos,
+                client, cfg.bridge_availability_topic if cfg.probe_discovery_enabled else cfg.availability_topic,
+                cfg.mqtt_timeout, cfg.qos,
                 command_topic=cfg.calibration_command_topic if (
                     cfg.calibration_enabled is True or cfg.temperature_calibration_enabled is True
                 ) else None,
                 read_command_topic=cfg.read_command_topic,
+                command_topics=self._command_topics,
             )
             self.publisher.connect()
             self._last_ping = self.ticks()
@@ -385,7 +401,7 @@ class Runtime:
     async def _connect_probe(self):
         cfg = self.settings
         self._connect_stage = "BLE connection"
-        self.device = self.aioble.Device(self.aioble.ADDR_PUBLIC, cfg.address)
+        self.device = self.aioble.Device(self._address_type, cfg.address)
         self.connection = await self.device.connect(timeout_ms=int(cfg.scan_timeout * 1000))
         self.report("info", "BLE connected to %s; requesting ATT MTU 512" % cfg.address)
         self._connect_stage = "ATT MTU exchange"
@@ -413,6 +429,51 @@ class Runtime:
         await self.notify.subscribe(notify=True)
         self._subscribed = True
         self.report("info", "BLE notifications subscribed")
+
+    def select_probe(self, settings, address_type):
+        if self.device is not None or self.connection is not None:
+            raise ProbeError("Disconnect the active probe before selecting another")
+        if isinstance(address_type, bool) or not isinstance(address_type, int) or address_type not in (0, 1):
+            raise ProbeError("Unsupported Bluetooth address type")
+        self.settings = settings
+        self._address_type = address_type
+
+    def set_command_topics(self, topics):
+        if self.publisher is not None:
+            self.publisher.set_command_topics(topics)
+        self._command_topics = list(topics)
+        self._custom_command_topics = True
+
+    async def scan_probes(self):
+        if self.device is not None or self.connection is not None:
+            raise ProbeError("Disconnect the active probe before Bluetooth scanning")
+        found = {}
+        limit_reported = False
+        async with self.aioble.scan(
+            duration_ms=int(self.settings.scan_timeout * 1000),
+            interval_us=30000, window_us=30000, active=True,
+        ) as scanner:
+            async for result in scanner:
+                name = result.name()
+                if advertised_type(name) is None:
+                    continue
+                device = result.device
+                address = ":".join("%02X" % octet for octet in device.addr)
+                try:
+                    item = probe_description(address, device.addr_type, name)
+                except ValueError as error:
+                    self.report("warning", "Ignoring malformed ReefSense advertisement: " + str(error))
+                    continue
+                previous = found.get(item["id"])
+                if previous is not None and previous["probe_type"] != item["probe_type"]:
+                    raise ProbeError("Conflicting advertised probe type for " + item["id"])
+                if previous is None and len(found) >= self.settings.max_probes:
+                    if not limit_reported:
+                        self.report("warning", "Probe scan reached max_probes; additional devices are not added")
+                        limit_reported = True
+                    continue
+                found[item["id"]] = item
+        return list(found.values())
 
     async def connect_probe(self):
         self._closed = False
@@ -522,11 +583,8 @@ class Runtime:
                     return
             await asyncio.sleep(min(0.25, max(0, seconds - self.elapsed(start))))
 
-    async def close(self):
-        if self._closed:
-            return
+    async def disconnect_probe(self):
         connection, self.connection = self.connection, None
-        publisher, self.publisher = self.publisher, None
         ble_started = self.device is not None or connection is not None
         self.device = self.writer = self.notify = self.queue = None
         self._subscribed = False
@@ -539,13 +597,19 @@ class Runtime:
                 except (OSError, asyncio.TimeoutError, self.aioble.DeviceDisconnectedError) as error:
                     self.report("warning", "BLE cleanup: " + describe_error(error))
         finally:
-            try:
-                # Also abort a controller connection attempt whose await timed out.
-                if ble_started:
-                    self.aioble.stop()
-            finally:
-                if publisher is not None:
-                    publisher.close()
+            # Also abort a controller connection attempt whose await timed out.
+            if ble_started:
+                self.aioble.stop()
+
+    async def close(self):
+        if self._closed:
+            return
+        publisher, self.publisher = self.publisher, None
+        try:
+            await self.disconnect_probe()
+        finally:
+            if publisher is not None:
+                publisher.close()
         self._closed = True
 
 
@@ -555,6 +619,7 @@ def main():
 
     overrides = dict(getattr(config, "OVERRIDES", {}))
     overrides.setdefault("temperature_calibration_enabled", True)
+    overrides.setdefault("probe_discovery_enabled", True)
     for field, name in (
         ("wifi_ssid", "WIFI_SSID"), ("wifi_password", "WIFI_PASSWORD"),
         ("username", "MQTT_USERNAME"), ("password", "MQTT_PASSWORD"),

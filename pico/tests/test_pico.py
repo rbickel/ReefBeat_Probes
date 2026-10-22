@@ -1708,6 +1708,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(settings.poll_interval, 300)
         self.assertFalse(settings.discovery_enabled)
         self.assertTrue(settings.temperature_calibration_enabled)
+        self.assertTrue(settings.probe_discovery_enabled)
         self.assertFalse(settings.calibration_enabled)
         keys = {topic.split("/")[-2] for topic, _ in reef_mqtt.discovery_messages(settings)}
         self.assertIn("temperature_calibration", keys)

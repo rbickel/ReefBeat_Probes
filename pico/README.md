@@ -5,7 +5,9 @@ only a platform adapter, not a second publisher application.
 
 ```text
 reef_mqtt.py                 shared Settings and run_bridge policy loop
+reef_mqtt_multi.py           shared inventory, round-robin polling and command routing
 reef_mqtt_payload.py         shared MQTT payload formatting
+reef_probe_profiles.py       advertisement identities and pH/ORP/salinity telemetry profiles
 reef_mqtt_diagnostics.py     full JSON diagnostics and bounded MQTT chunking
 reef_calibration.py          shared opt-in staged calibration controller
 reef_probe_protocol.py       shared ReefSense framing/parser/validation
@@ -17,7 +19,10 @@ pico_mqtt.py                 bounded bidirectional umqtt.simple adapter
 The board's two-line [main.py](main.py) calls `reef_mqtt.main()`. The canonical
 entrypoint selects the MicroPython adapter; [pico_runtime.main()](pico_runtime.py)
 loads local configuration and runs **the same root `run_bridge()`**. There is no
-Pico polling/retry/availability policy loop or duplicate wire parser.
+Pico-owned polling/retry/availability loop or duplicate wire parser. In automatic
+mode that entrypoint selects the portable multi-probe supervisor; fixed-address
+mode retains the original single-probe loop. Linux currently uses fixed-address
+mode; its adapter does not implement the automatic-discovery interface.
 
 Use a **Pico W**, not the non-W Pico, with recent official
 [RPI_PICO_W MicroPython](https://micropython.org/download/RPI_PICO_W/), which lists
@@ -52,9 +57,14 @@ Optional `OVERRIDES` uses **canonical lower-case Settings field names**, such as
 `temperature_topic`, `availability_topic`, `temperature_sensor`, `wifi_timeout`,
 `wifi_disable_power_save`, `wifi_country`, `status_led`, `read_command_topic`,
 `discovery_enabled`, `discovery_prefix`, and `temperature_calibration_enabled`.
+`probe_discovery_enabled`, `max_probes`, `probe_topic_prefix`,
+`probe_scan_command_topic`, `probe_scan_state_topic`, `bridge_availability_topic`,
+and `probe_registry_path` configure automatic probe management.
 Most defaults live in the root module, not a duplicate Pico configuration class.
 The Pico entrypoint enables `temperature_calibration_enabled` by default while
 respecting an explicit override; Linux keeps temperature calibration opt-in.
+It also enables `probe_discovery_enabled` by default. A fixed Bluetooth address
+is not required for connecting to automatically discovered probes.
 Normal readings default to **300 seconds (five minutes)**. Configure the period
 with `OVERRIDES["poll_interval"] = 300.0`, or another finite positive number of
 seconds. Read now still requests an immediate reading, and calibration timing
@@ -124,7 +134,7 @@ Existing manual MQTT entities are not automatically migrated to discovery.
 ### Automatic Home Assistant discovery
 
 Discovery is **enabled by default**. With Home Assistant MQTT discovery enabled,
-continuous mode creates one **ReefSense probe** device containing pH, temperature,
+fixed-address mode creates one **ReefSense probe** device containing pH, temperature,
 Read now, pH voltage, temperature voltage, probe status, last-reading timestamp,
 and calibration status. The last five sensors are categorized as diagnostics.
 **Calibrate temperature** and **Temperature offset** are also included by default,
@@ -132,6 +142,10 @@ giving ten entities on the same device. Setting
 `temperature_calibration_enabled=False` leaves the eight base entities.
 Calibration status shows `disabled` only when both calibration features are off;
 discovery itself never sends calibration POSTs.
+
+The default automatic Bluetooth mode instead creates a **ReefSense bridge**
+device and a separate device for each physical probe, including multiple probes
+of the same type. See the scan and topic details below.
 
 Merge this into the board's existing `config.py` `OVERRIDES`, retaining other
 overrides and credentials:
@@ -158,11 +172,94 @@ Raw-voltage/status entities use the bounded
 `reef/reef_probe/diagnostics/summary` topic by default, independently of the full
 diagnostic records. See [complete discovery behavior](../README.md#automatic-home-assistant-discovery).
 
+### Automatic Bluetooth discovery and multiple probes
+
+**Enabled by default on Pico W.** At startup the bridge actively scans for
+`RS_PH`, `RS_ORP`, `RS_SAL`, and `RS_TEMP` advertisements. It retains their actual
+Bluetooth address types and verifies the ReefSense GATT service when connecting.
+No MAC address needs to be added to a Python file for new probes. Discovery only
+finds advertising probes: close ReefBeat and other BLE clients first.
+
+The stock MicroPython RP2 Bluetooth configuration uses one HCI connection and
+one GATT client. The supervisor therefore connects to **one probe at a time**,
+reads it, disconnects only BLE, and moves to the next probe. WiFi, MQTT and NTP
+remain shared. Each physical probe has its own 300-second schedule, retries,
+availability, protected command context, and calibration marker. Hardware RAM
+and radio/coexistence limits remain unverified; `max_probes` defaults to eight
+as a software bound, not a certified hardware capacity.
+
+**Scan for probes** is auto-discovered on the bridge device. The equivalent MQTT
+request is:
+
+```yaml
+action: mqtt.publish
+data:
+  topic: reef/reef_probe/scan/command
+  payload: "SCAN"
+  qos: 1
+  retain: false
+```
+
+Scan status and known identities are retained on `reef/reef_probe/scan/state`;
+the bridge device also exposes **Probe count** and **Scan status**. An empty scan
+does not erase saved devices. Scan failures are reported and retried with a
+bounded delay while known probes remain usable. Newly discovered devices extend
+the exact-topic subscriptions; no command wildcard is used.
+
+Identity uses the automatically discovered address plus address type, not the
+advertised name or probe type. Two identically named pH probes remain separate.
+Public addresses use an ID such as `b0a60425ba7e`; random-address devices use
+`r_` plus the address. Per-probe topics are:
+
+| Topic suffix under `reef/probes/<id>/` | Purpose |
+|---|---|
+| `ph/state`, `temperature/state` | pH probe measurements |
+| `orp/state` | ORP in mV; no invented temperature |
+| `salinity/state`, `conductivity/state`, `specific_gravity/state`, `temperature/state` | Salinity profile readings |
+| `read/command` | Exact `READ`, QoS 1, retain=false |
+| `availability` | Per-probe online/offline |
+| `diagnostics/summary`, `diagnostics/telemetry` | Bounded scalar summary and full firmware response |
+| `calibration/command`, `calibration/state`, `calibration/event`, `calibration/failure` | Independently guarded pH workflow, when enabled |
+
+The app's ORP model supplies `value`/`mv`; salinity supplies `rms_ppt`, `rms_ec`,
+`rms_sg`, temperature and raw voltages. Conductivity is published in mS/cm,
+salinity in ppt, and specific gravity without a unit. These profiles are based
+on APK schemas and offline packets, **not physical ORP/salinity validation**.
+They remain read-only: pH and temperature-calibration permissions are never
+inherited by ORP, salinity, or standalone-temperature probes. Stop the bridge
+before calibrating those unverified types with another client.
+
+`probes.json` stores known identities and the primary pH identity. Keep it on a
+writable persistent filesystem. Compatibility pH/temperature topics, their
+availability, diagnostics, and calibration topics are aliases only for the
+previous configured primary pH probe; they never switch to another pH probe just
+because that probe is temporarily absent. The registry pins that selection
+across restarts and scan-order changes. All other probes use their unique topics.
+Preserve the registry and **all** calibration markers during upgrades. A corrupt
+registry or ambiguous legacy marker is reported rather than guessed away.
+
+During any active pH calibration, the target connection remains pinned and
+other probes are marked unavailable and paused. Their reads and new scans are
+deferred until the workflow finishes; then fresh readings restore availability.
+Commands carrying another probe's tokens are rejected. Uncertain additive
+temperature writes are never replayed after reconnection.
+
+Each discovered sensor checks both its probe availability and the bridge's
+`reef/reef_bridge/availability` last will. Existing manual consumers of the old
+primary availability topic should also honor the bridge topic or the 900-second
+expiry: MQTT supplies only one last will for the shared client.
+
+Set `probe_discovery_enabled=False` to retain the old fixed-address connection
+mode. `discovery_enabled=False` independently stops HA configuration announcements,
+not BLE discovery or MQTT scan/read commands.
+
 ### Read now button in Home Assistant
 
 Press the discovered **Read now** button to request fresh pH and temperature
 values without waiting for the next 300-second poll. The Pico services requests during its 250 ms wait checks; the
 probe's BLE response time is additional. Normal polling continues afterward.
+In automatic mode a read can also require BLE reconnection; it is prioritized
+without waiting for the normal polling period, unless another probe is calibrating.
 
 The default `read_command_topic` is `reef/reef_probe/read/command`. Commands use
 The exact payload `READ`, QoS 1, and **retain=false**. Calibration starts only
@@ -251,7 +348,9 @@ See [full protocol, safety, and recovery details](../README.md#firmware-temperat
    | Workspace source | Board filename |
    | --- | --- |
    | [../reef_mqtt.py](../reef_mqtt.py) | `reef_mqtt.py` |
+   | [../reef_mqtt_multi.py](../reef_mqtt_multi.py) | `reef_mqtt_multi.py` |
    | [../reef_mqtt_payload.py](../reef_mqtt_payload.py) | `reef_mqtt_payload.py` |
+   | [../reef_probe_profiles.py](../reef_probe_profiles.py) | `reef_probe_profiles.py` |
    | [../reef_mqtt_diagnostics.py](../reef_mqtt_diagnostics.py) | `reef_mqtt_diagnostics.py` |
    | [../reef_calibration.py](../reef_calibration.py) | `reef_calibration.py` |
    | [../reef_probe_protocol.py](../reef_probe_protocol.py) | `reef_probe_protocol.py` |
@@ -261,6 +360,8 @@ See [full protocol, safety, and recovery details](../README.md#firmware-temperat
 
    `reef_calibration.py` is mandatory even when calibration is disabled: the
    shared application imports it to check for a pending recovery marker.
+   Deploy the complete table for automatic mode, including the updated payload
+   helper and MQTT transport. Keep `probes.json` and every pending marker.
    Do not copy Linux adapter files or tests to the board. Remove obsolete board
    copies of `pico_bridge.py` and `pico_protocol.py` from the earlier experiment.
 
@@ -334,8 +435,9 @@ argument. Preserve the board's credentials and any `calibration.pending` marker.
   A plausible RTC (2024–2099) and successful NTP synchronization are required.
   UTC formatting uses `gmtime()` directly, supporting 1970 and 2000 epochs.
   `epoch()` returns UNIX seconds, adding 946684800 on a year-2000 epoch port.
-- `connect_probe()` discovers and subscribes once per BLE connection; subsequent
-  reads keep that connection. Setup explicitly requests ATT MTU 512 through
+- `connect_probe()` discovers and subscribes once per BLE connection. Fixed-address
+  mode keeps the connection; automatic mode releases BLE between scheduled probes
+  and pins it during calibration. Setup explicitly requests ATT MTU 512 through
   `connection.exchange_mtu(...)`, matching the Android app, and prints the
   negotiated value before discovering/subscribing. `sleep(..., monitor_probe=True)` notices a
   disconnect and raises to the canonical retry loop, which closes/reconnects.
@@ -348,9 +450,10 @@ argument. Preserve the board's credentials and any `calibration.pending` marker.
   `/firmware`, `/config`, `/calibration-status` and `/calibration-log`. GET payloads
   support the controller's point-specific calibration-log queries. It permits
   POST `/calibration-enter`, `/calibration-point-start` and `/calibration-exit`
-  **only with calibration enabled**; all other operations are rejected.
-  No pairing, scans, reset or firmware-update writes are implemented.
-  The known probe address is treated as public.
+  **only with pH calibration enabled**. POST `/offset` has its own temperature
+  permission and payload guard. Factory offsets, resets, and firmware updates
+  remain forbidden. No pairing is requested. Automatic scans preserve public or
+  random address type; fixed-address mode retains the public-address behavior.
 - Requests are serialized with an asyncio lock and fragmented using the actual
   negotiated MTU. Every fragment sequentially awaits its GATT write response;
   there is no separate application-ACK handshake or outbound inter-fragment ACK.
@@ -534,6 +637,11 @@ not a claim of MicroPython execution.
 The temperature integration test renders the auto-discovered command template,
 delivers it over the scripted MQTT subscription, verifies the sole BLE
 `/offset` write, and confirms fresh publication only after compensation settling.
+Automatic-discovery tests cover two identically named pH probes plus ORP/salinity,
+registry persistence, primary aliases, individual failures, 300-second cadence,
+scan/read routing, exact dynamic SUBACKs, and calibration connection pinning.
+An adapter integration test scans and cycles two pH probes and an ORP probe
+through the actual shared supervisor and scripted BLE/MQTT drivers.
 
 Validation on 2026-09-27: **86 offline tests passed**, and actual
 **mpy-cross v1.29.0** successfully compiled `pico_runtime.py`, `pico_mqtt.py`,

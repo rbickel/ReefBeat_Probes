@@ -5,6 +5,9 @@ firmware_downloads/
 .env
 pico/config.py
 calibration.pending
+calibration.pending.*
+probes.json
+probes.json.tmp
 firmware_update.pending
 unpacked/
 ReefBeat_8.1.7_APKPure.xapk

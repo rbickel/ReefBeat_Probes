@@ -46,11 +46,23 @@ def _length(value):
             return bytes(result)
 
 
+def _command_topics(topics):
+    if not isinstance(topics, (list, tuple)):
+        raise ValueError("MQTT command topics must be a list or tuple")
+    result = tuple(_topic(topic) for topic in topics)
+    if len(set(result)) != len(result):
+        raise ValueError("MQTT command topics must be distinct")
+    size = 2 + sum(3 + len(topic) for topic in result)
+    if 1 + len(_length(size)) + size > MAX_PACKET_SIZE:
+        raise ValueError("MQTT command topics are too long")
+    return result
+
+
 class Publisher:
     """Use upstream CONNECT/QoS0 sends, not its blocking inbound/subscribe code."""
 
     def __init__(self, client, availability_topic, socket_timeout, qos=0, command_topic=None,
-                 read_command_topic=None):
+                 read_command_topic=None, command_topics=None):
         if qos != 0:
             raise ValueError("Pico transport supports bounded QoS 0 publishing only")
         if socket_timeout <= 0:
@@ -58,13 +70,10 @@ class Publisher:
         self.client = client
         self.availability_topic = _topic(availability_topic)
         self.command_topic = _topic(command_topic) if command_topic is not None else None
-        self.command_topics = tuple(_topic(topic) for topic in (read_command_topic, command_topic)
-                                    if topic is not None)
-        if len(set(self.command_topics)) != len(self.command_topics):
-            raise ValueError("MQTT command topics must be distinct")
-        size = 2 + sum(3 + len(topic) for topic in self.command_topics)
-        if 1 + len(_length(size)) + size > MAX_PACKET_SIZE:
-            raise ValueError("MQTT command topics are too long")
+        topics = command_topics if command_topics is not None else [
+            topic for topic in (read_command_topic, command_topic) if topic is not None
+        ]
+        self.command_topics = _command_topics(topics)
         self.socket_timeout = socket_timeout
         self.qos = qos
         self.connected = False
@@ -223,6 +232,30 @@ class Publisher:
             self._read(start, timeout)
         self._remaining(start, timeout)
 
+    def _subscribe(self):
+        self._pid = self._pid % 65535 + 1
+        self._suback = self._pid
+        body = bytes((self._pid >> 8, self._pid & 255))
+        for topic in self.command_topics:
+            body += bytes((len(topic) >> 8, len(topic) & 255)) + topic + b"\x01"
+        start = _ticks()
+        self._write(b"\x82" + _length(len(body)) + body, start)
+        self._wait(start)
+
+    def set_command_topics(self, topics):
+        topics = _command_topics(topics)
+        if topics == self.command_topics:
+            return
+        if not set(self.command_topics).issubset(topics):
+            raise ValueError("Removing MQTT subscriptions requires a clean reconnect")
+        self.command_topics = topics
+        if self.connected:
+            try:
+                self._subscribe()
+            except BaseException:
+                self.connected = False
+                raise
+
     def connect(self):
         self.connected = False
         self._queue.clear()
@@ -237,14 +270,7 @@ class Publisher:
             if session_present:
                 raise OSError("MQTT clean session unexpectedly resumed")
             if self.command_topics:
-                self._pid = self._pid % 65535 + 1
-                self._suback = self._pid
-                body = bytes((self._pid >> 8, self._pid & 255))
-                for topic in self.command_topics:
-                    body += bytes((len(topic) >> 8, len(topic) & 255)) + topic + b"\x01"
-                start = _ticks()
-                self._write(b"\x82" + _length(len(body)) + body, start)
-                self._wait(start)
+                self._subscribe()
             self.connected = True
             self.ping()
         except BaseException:

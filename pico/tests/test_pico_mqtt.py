@@ -77,6 +77,34 @@ class WireClient(Client):
 
 
 class MQTTWireTests(unittest.TestCase):
+    def test_discovery_can_add_exact_topics_without_dropping_pending_commands(self):
+        client, publisher = self.make()
+        publisher.connect()
+        client.wire.feed(command(b"old", retained=True))
+        publisher.pump()
+        client.wire.before_suback = command(b"READ", topic=READ_TOPIC, pid=8)
+        additional = b"reef/probes/112233445566/read/command"
+        publisher.set_command_topics([TOPIC, READ_TOPIC, additional])
+        self.assertEqual(publisher.command_topics, (TOPIC, READ_TOPIC, additional))
+        self.assertEqual(publisher.commands(), [
+            (TOPIC_TEXT, b"old", True), (READ_TOPIC_TEXT, b"READ", False),
+        ])
+        count = len(client.wire.writes)
+        publisher.set_command_topics([TOPIC, READ_TOPIC, additional])
+        self.assertEqual(len(client.wire.writes), count)
+
+    def test_dynamic_subscription_failure_and_unsafe_changes_are_explicit(self):
+        client, publisher = self.make()
+        publisher.connect()
+        for topics in ([TOPIC, b"bad/+"], [READ_TOPIC], [TOPIC, TOPIC]):
+            with self.subTest(topics=topics), self.assertRaises(ValueError):
+                publisher.set_command_topics(topics)
+        self.assertTrue(publisher.connected)
+        client.wire.ack_codes = [1, 0]
+        with self.assertRaisesRegex(OSError, "SUBACK"):
+            publisher.set_command_topics([TOPIC, READ_TOPIC])
+        self.assertFalse(publisher.connected)
+
     def make(self, enabled=True, read_enabled=False):
         client = WireClient()
         publisher = Publisher(
