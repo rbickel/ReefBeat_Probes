@@ -219,7 +219,18 @@ Public addresses use an ID such as `b0a60425ba7e`; random-address devices use
 | `read/command` | Exact `READ`, QoS 1, retain=false |
 | `availability` | Per-probe online/offline |
 | `diagnostics/summary`, `diagnostics/telemetry` | Bounded scalar summary and full firmware response |
+| `diagnostics/identity` | Retained identity JSON: MAC address, address type, ID, name and probe type |
 | `calibration/command`, `calibration/state`, `calibration/event`, `calibration/failure` | Independently guarded pH workflow, when enabled |
+
+Every discovered probe also has a read-only **Bluetooth MAC address** diagnostic
+sensor on its Home Assistant device. It reads `address` from the retained
+`diagnostics/identity` document, in normalized `AA:BB:CC:DD:EE:FF` form.
+Identity is published from discovery or the saved inventory without a BLE read,
+so the property remains visible when the probe or bridge is offline. It has no
+command topic, measurement expiry, or availability gate. Public and random
+address types still have separate device/entity identities.
+With HA discovery disabled the retained identity document is still published,
+but no automatic sensor configuration is sent.
 
 The app's ORP model supplies `value`/`mv`; salinity supplies `rms_ppt`, `rms_ec`,
 `rms_sg`, temperature and raw voltages. Conductivity is published in mS/cm,

@@ -501,6 +501,78 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.calibration.state, "recovery_required")
         self.assertEqual(self.values(second, self.settings.ph_topic), [])
 
+    async def test_each_probe_has_a_retained_read_only_mac_property_without_ble_requests(self):
+        runtime = self.runtime([PH_A, PH_B, ORP, SAL])
+        manager = Supervisor(self.settings, runtime, self.stop)
+        manager._merge([PH_A, PH_B, ORP, SAL])
+        for probe in manager.probes.values():
+            await manager._discover(probe)
+        self.assertEqual(runtime.requests, [])
+        configs = {
+            json.loads(payload)["unique_id"]: json.loads(payload)
+            for topic, payload, retain, _ in runtime.messages
+            if topic.endswith("/bluetooth_address/config")
+        }
+        self.assertEqual(len(configs), 4)
+        for description in (PH_A, PH_B, ORP, SAL):
+            identifier = description["id"]
+            config = configs["reef_probe_" + identifier + "_bluetooth_address"]
+            topic = self.settings.probe_topic_prefix + "/" + identifier + "/diagnostics/identity"
+            self.assertEqual(config["name"], "Bluetooth MAC address")
+            self.assertEqual(config["state_topic"], topic)
+            self.assertEqual(config["value_template"], "{{ value_json.address }}")
+            self.assertEqual(config["entity_category"], "diagnostic")
+            self.assertEqual(config["device"]["identifiers"], ["reef_probe_" + identifier])
+            for field in ("command_topic", "command_template", "availability", "availability_topic", "expire_after"):
+                self.assertNotIn(field, config)
+            identities = [(json.loads(payload), retain) for target, payload, retain, _ in runtime.messages
+                          if target == topic]
+            self.assertEqual(identities, [(description, True)])
+            self.assertNotIn(topic, manager._topics())
+        self.assertTrue(all(retain for topic, _, retain, _ in runtime.messages
+                            if topic.endswith("/bluetooth_address/config")))
+
+    async def test_mac_metadata_is_published_with_ha_discovery_disabled(self):
+        self.settings.discovery_enabled = False
+        runtime = self.runtime([PH_A])
+        manager = Supervisor(self.settings, runtime, self.stop)
+        manager._merge([PH_A])
+        probe = manager.probes[PH_A["id"]]
+        await manager._discover(probe)
+        self.assertFalse(any(topic.endswith("/config") for topic, _, _, _ in runtime.messages))
+        identities = [json.loads(payload) for topic, payload, retain, _ in runtime.messages
+                      if topic == probe.settings.probe_diagnostics_topic + "/identity" and retain]
+        self.assertEqual(identities, [PH_A])
+        self.assertEqual(runtime.requests, [])
+
+    async def test_cached_offline_probe_still_publishes_its_mac_on_restart(self):
+        runtime = self.runtime([PH_A])
+        first = Supervisor(self.settings, runtime, self.stop)
+        first._merge([PH_A])
+        runtime.discoveries = []
+        runtime.fail_reads.add(PH_A["id"])
+        second = Supervisor(self.settings, runtime, self.stop)
+        await second.run()
+        topic = second.probes[PH_A["id"]].settings.probe_diagnostics_topic + "/identity"
+        identities = [json.loads(payload) for target, payload, retain, _ in runtime.messages
+                      if target == topic and retain]
+        self.assertTrue(identities)
+        self.assertTrue(all(identity["address"] == PH_A["address"] for identity in identities))
+        self.assertEqual(self.values(runtime, self.settings.ph_topic), [])
+
+    async def test_same_mac_with_different_address_types_keeps_distinct_read_only_properties(self):
+        random = probe_description(PH_A["address"], 1, PH_A["name"])
+        runtime = self.runtime([PH_A, random])
+        manager = Supervisor(self.settings, runtime, self.stop)
+        manager._merge([PH_A, random])
+        configs = [config for probe in manager.probes.values()
+                   for topic, config in probe_discovery(manager, probe)
+                   if topic.endswith("/bluetooth_address/config")]
+        self.assertEqual(len(configs), 2)
+        self.assertEqual(len({config["unique_id"] for config in configs}), 2)
+        self.assertEqual(len({config["state_topic"] for config in configs}), 2)
+        self.assertEqual(len({tuple(config["device"]["identifiers"]) for config in configs}), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

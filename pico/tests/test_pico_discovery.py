@@ -177,6 +177,15 @@ class PicoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         configs = [json.loads(payload) for topic, payload, _, _ in client.publications
                    if topic.endswith(b"/ph/config")]
         self.assertEqual(len({config["unique_id"] for config in configs}), 2)
+        address_configs = [json.loads(payload) for topic, payload, retain, _ in client.publications
+                           if topic.endswith(b"/bluetooth_address/config") and retain]
+        self.assertEqual(len({config["unique_id"] for config in address_configs}), 3)
+        identities = {json.loads(payload)["id"]: json.loads(payload)["address"]
+                      for topic, payload, retain, _ in client.publications
+                      if topic.endswith(b"/diagnostics/identity") and retain}
+        self.assertEqual(identities, {
+            description["id"]: description["address"] for description in (PH_A, PH_B, ORP)
+        })
 
 
 if __name__ == "__main__":

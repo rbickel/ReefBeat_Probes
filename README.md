@@ -188,6 +188,13 @@ salinity/conductivity/specific-gravity, and standalone-temperature profiles use
 their own validated telemetry fields; ORP/salinity calibration is not enabled by
 the pH permissions.
 
+Each discovered probe exposes a read-only **Bluetooth MAC address** diagnostic
+in Home Assistant. Its retained MQTT identity document is published at
+`reef/probes/<id>/diagnostics/identity` and includes `address`, `address_type`,
+`id`, `name`, and `probe_type`. The static MAC property remains visible offline
+and requires no additional BLE request; identity data is also published when HA
+discovery announcements are disabled.
+
 Stock Pico W MicroPython is configured for one BLE connection, so the portable
 supervisor polls probes round-robin while keeping one shared MQTT connection.
 It pins the connection during calibration and temporarily pauses other probes

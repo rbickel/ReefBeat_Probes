@@ -205,6 +205,13 @@ def probe_discovery(manager, probe):
         "manufacturer": "Red Sea", "model": "ReefSense " + MODEL_NAMES[probe.probe_type],
         "via_device": bridge_identifier(manager.settings),
     }
+    # Static identity remains useful while the probe or bridge is offline.
+    yield settings.discovery_prefix + "/sensor/" + identifier + "/bluetooth_address/config", {
+        "name": "Bluetooth MAC address", "unique_id": identifier + "_bluetooth_address",
+        "device": device, "state_topic": settings.probe_diagnostics_topic + "/identity",
+        "value_template": "{{ value_json.address }}", "entity_category": "diagnostic",
+        "icon": "mdi:bluetooth",
+    }
     if probe.probe_type == "ph":
         configurations = discovery_messages(settings)
     else:
@@ -390,6 +397,10 @@ class Supervisor:
         }))
 
     async def _discover(self, probe):
+        await probe.runtime.publish(
+            probe.settings.probe_diagnostics_topic + "/identity",
+            json.dumps(probe.description), retain=True,
+        )
         if not self.settings.discovery_enabled:
             return
         for topic, config in probe_discovery(self, probe):
