@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+import runpy
 import struct
 import sys
 from types import SimpleNamespace
@@ -468,6 +469,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         async def virtual_sleep(seconds):
             nonlocal sent
             self.clock.advance(seconds)
+            if not self.hardware.clients:
+                await real_sleep(0)
+                return
             client = self.hardware.clients[0]
             if not sent and any(topic.decode() == self.settings.temperature_topic
                                 for topic, _, _, _ in client.publications):
@@ -621,7 +625,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         real_sleep = asyncio.sleep
 
         async def virtual_sleep(seconds):
-            self.clock.advance(seconds)
+            if asyncio.current_task() is not self.runtime._indicator_task:
+                self.clock.advance(seconds)
             await real_sleep(0)
 
         with patch.object(pico_runtime.asyncio, "sleep", virtual_sleep), \
@@ -717,6 +722,11 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
         for event, expected_changes, expected_waits in (
             ("initializing", [1, 0], [0.1, 0.2]),
+            ("wifi_connecting", [1, 0], [0.1, 0.9]),
+            ("time_sync", [1, 0], [0.8, 0.2]),
+            ("mqtt_connecting", [1, 0], [0.3, 0.3]),
+            ("scanning", [1, 0, 1, 0, 1, 0], [0.1, 0.1, 0.1, 0.1, 0.1, 0.9]),
+            ("ble_connecting", [1, 0, 1, 0], [0.3, 0.1, 0.1, 0.9]),
             ("error", [1, 0], [0.5, 1.5]),
             ("published", [1, 0, 1, 0], [0.1, 0.1, 0.1, 1.2]),
         ):
@@ -1577,7 +1587,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         real_sleep = asyncio.sleep
 
         async def virtual_sleep(seconds):
-            self.clock.advance(seconds)
+            if asyncio.current_task() is not self.runtime._indicator_task:
+                self.clock.advance(seconds)
             await real_sleep(0)
 
         with patch.object(pico_runtime.asyncio, "sleep", virtual_sleep):
@@ -1616,7 +1627,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime._indicator_state, "ok")
         await self.runtime.indicate("waiting")
         self.assertEqual(self.runtime._indicator_state, "ok")
-        self.assertIsNot(self.runtime._indicator_task, first_task)
+        self.assertIs(self.runtime._indicator_task, first_task)
         await self.runtime.indicate("stopped")
 
     async def test_ntp_failure_or_bad_rtc_does_not_connect_mqtt(self):
@@ -1684,7 +1695,14 @@ class DriverTests(unittest.TestCase):
         self.assertFalse(queue.overflow)
 
     def test_board_entrypoint_delegates_to_canonical_main(self):
-        self.assertEqual((PICO / "main.py").read_text(), "import reef_mqtt\nreef_mqtt.main()\n")
+        with (
+            patch.dict(sys.modules, Hardware().modules),
+            patch("time.sleep"),
+            patch("builtins.print"),
+            patch.object(reef_mqtt, "main") as canonical_main,
+        ):
+            runpy.run_path(str(PICO / "main.py"), run_name="__main__")
+        canonical_main.assert_called_once_with()
         self.assertFalse((PICO / "pico_bridge.py").exists())
         self.assertFalse((PICO / "pico_protocol.py").exists())
 

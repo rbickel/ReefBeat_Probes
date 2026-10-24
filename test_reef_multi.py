@@ -152,6 +152,55 @@ class Runtime:
 
 
 class ProfileTests(unittest.TestCase):
+    def test_address_validation_rejects_malformed_inputs_and_normalizes_case(self):
+        self.assertEqual(probe_identity("aB:cD:eF:01:23:45"), ("AB:CD:EF:01:23:45", "abcdef012345"))
+        self.assertEqual(probe_identity("aB:cD:eF:01:23:45", 1), ("AB:CD:EF:01:23:45", "r_abcdef012345"))
+        for address in (
+            None, b"11:22:33:44:55:66", "", "11:22:33:44:55", "111:22:33:44:55:66",
+            "11-22:33:44:55:66", "11:22:33:44:55:GG", "11::2:33:44:55:66",
+            "11:22:33:44:55:66:77",
+        ):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                probe_identity(address)
+
+    def test_registry_parses_directly_from_unread_stream_after_collection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "probes.json")
+            registry = Registry(path, 8)
+            registry.save({PH_A["id"]: PH_A}, PH_A["id"])
+            parse = json.load
+
+            def read_stream(source):
+                self.assertEqual(source.tell(), 0)
+                collect.assert_called_once_with()
+                return parse(source)
+
+            with (
+                patch("reef_mqtt_multi.gc.collect") as collect,
+                patch("reef_mqtt_multi.json.load", side_effect=read_stream) as load,
+            ):
+                registry.load()
+            load.assert_called_once()
+            self.assertEqual(registry.probes, {PH_A["id"]: PH_A})
+            self.assertEqual(registry.primary, PH_A["id"])
+
+    def test_registry_rejects_oversized_file_before_parsing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "probes.json"
+            path.write_text(" " * 8193)
+            with patch("reef_mqtt_multi.json.load") as load:
+                with self.assertRaisesRegex(ValueError, "bounded size"):
+                    Registry(str(path), 8).load()
+            load.assert_not_called()
+            self.assertEqual(path.stat().st_size, 8193)
+
+    def test_registry_missing_file_starts_empty(self):
+        with tempfile.TemporaryDirectory() as folder:
+            registry = Registry(str(Path(folder) / "missing.json"), 8)
+            registry.load()
+            self.assertEqual(registry.probes, {})
+            self.assertIsNone(registry.primary)
+
     def test_same_name_and_type_are_separate_devices_and_random_addresses_stay_distinct(self):
         self.assertNotEqual(PH_A["id"], PH_B["id"])
         random = probe_description(PH_A["address"], 1, PH_A["name"])
@@ -256,6 +305,54 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.values(runtime, base + "/" + PH_B["id"] + "/ph/state"), [7.9])
         self.assertEqual(self.values(runtime, self.settings.ph_topic), [])
         self.assertTrue(runtime.report.called)
+
+    async def test_out_of_range_probe_reconnects_without_restarting_mqtt_or_other_probes(self):
+        self.settings.poll_interval = 2
+        self.settings.retry_min = 1
+        self.settings.retry_max = 4
+        runtime = self.runtime([PH_A, PH_B])
+        runtime.stop_at = 18
+        connect = runtime.connect_probe
+        attempts = []
+
+        async def connect_when_in_range():
+            identifier = probe_identity(runtime.settings.address, runtime.address_type)[1]
+            if identifier == PH_A["id"]:
+                attempts.append(runtime.now)
+                if runtime.now < 8:
+                    runtime.now += 1
+                    raise ProbeConnectionError("Probe outside Bluetooth range")
+            await connect()
+
+        runtime.connect_probe = connect_when_in_range
+        with patch.object(runtime, "close", wraps=runtime.close) as close:
+            await run_bridge(self.settings, runtime, self.stop)
+        self.assertEqual(close.await_count, 1)
+        bridge_states = [payload for topic, payload, _, _ in runtime.messages
+                         if topic == self.settings.bridge_availability_topic]
+        self.assertEqual(bridge_states, ["online", "offline"])
+        base = self.settings.probe_topic_prefix
+        first_readings = [at for topic, _, _, at in runtime.messages
+                          if topic == base + "/" + PH_A["id"] + "/ph/state"]
+        other_readings = [at for topic, _, _, at in runtime.messages
+                          if topic == base + "/" + PH_B["id"] + "/ph/state"]
+        self.assertTrue(first_readings)
+        self.assertGreaterEqual(first_readings[0], 8)
+        self.assertTrue(any(at < 8 for at in other_readings))
+        self.assertTrue(any(at > first_readings[0] for at in other_readings))
+        first_states = [(payload, at) for topic, payload, _, at in runtime.messages
+                        if topic == base + "/" + PH_A["id"] + "/availability"]
+        self.assertTrue(any(payload == "offline" and at < 8 for payload, at in first_states))
+        self.assertTrue(any(payload == "online" and at >= 8 for payload, at in first_states))
+        self.assertGreaterEqual(len(attempts), 4)
+        for index, delay in enumerate((1, 2, 4)):
+            self.assertGreaterEqual(attempts[index + 1] - attempts[index], delay + 1)
+        warnings = [call.args[1] for call in runtime.report.call_args_list
+                    if call.args[0] == "warning"]
+        for delay in (1, 2, 4):
+            self.assertTrue(any("unavailable; retrying in %ss" % delay in message
+                                for message in warnings))
+        self.assertFalse(any(method == POST for _, _, _, method, _ in runtime.requests))
 
     async def test_five_minute_schedule_is_per_physical_probe(self):
         runtime = self.runtime([PH_A, PH_B])

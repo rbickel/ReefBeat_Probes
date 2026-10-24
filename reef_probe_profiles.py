@@ -43,13 +43,17 @@ def probe_identity(address, address_type=0):
         raise ValueError("Unsupported Bluetooth address type")
     if not isinstance(address, str):
         raise ValueError("Bluetooth address must be a string")
-    parts = address.split(":")
-    if len(parts) != 6 or any(
-        len(part) != 2 or any(c not in "0123456789abcdefABCDEF" for c in part) for part in parts
-    ):
+    if len(address) != 17:
         raise ValueError("Invalid Bluetooth address")
-    normalized = ":".join(part.upper() for part in parts)
-    identifier = "".join(parts).lower()
+    for index in range(17):
+        character = address[index]
+        if index % 3 == 2:
+            if character != ":":
+                raise ValueError("Invalid Bluetooth address")
+        elif character not in "0123456789abcdefABCDEF":
+            raise ValueError("Invalid Bluetooth address")
+    normalized = address.upper()
+    identifier = address.replace(":", "").lower()
     return normalized, ("r_" + identifier if address_type else identifier)
 
 

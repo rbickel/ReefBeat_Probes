@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pico_runtime
 from reef_mqtt import Settings, run_bridge
+from reef_mqtt_multi import Supervisor
 from reef_probe_protocol import ProbeError
 from test_pico import Clock, Connection, Hardware, fragments
 from test_reef_multi import PH_A, PH_B, ORP, PH_DATA, ORP_DATA
@@ -81,6 +82,22 @@ class PicoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.runtime.close()
+
+    async def test_scan_pattern_returns_to_previously_selected_healthy_state(self):
+        pin = self.hardware.modules["machine"].Pin
+        self.runtime.led = pin("LED", pin.OUT)
+        supervisor = Supervisor(self.settings, self.runtime, asyncio.Event())
+        try:
+            await supervisor._indicate("ok")
+            await self.runtime.scan_probes()
+            self.assertEqual(self.runtime._indicator_state, "scanning")
+            await supervisor._indicate("ok")
+            self.assertEqual(self.runtime._indicator_state, "ok")
+            task = self.runtime._indicator_task
+            await supervisor._indicate("ok")
+            self.assertIs(self.runtime._indicator_task, task)
+        finally:
+            await self.runtime.indicate("stopped")
 
     async def test_scan_filters_and_deduplicates_devices_while_preserving_address_type(self):
         random = dict(ORP, address_type=1)

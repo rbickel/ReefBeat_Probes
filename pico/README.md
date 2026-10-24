@@ -16,7 +16,8 @@ pico_runtime.py              Pico W WiFi, clock, BLE and sleep adapter
 pico_mqtt.py                 bounded bidirectional umqtt.simple adapter
 ```
 
-The board's two-line [main.py](main.py) calls `reef_mqtt.main()`. The canonical
+The board's [main.py](main.py) signals boot before importing and calling
+`reef_mqtt.main()`, and keeps fatal errors visible on the LED. The canonical
 entrypoint selects the MicroPython adapter; [pico_runtime.main()](pico_runtime.py)
 loads local configuration and runs **the same root `run_bridge()`**. There is no
 Pico-owned polling/retry/availability loop or duplicate wire parser. In automatic
@@ -205,6 +206,18 @@ the bridge device also exposes **Probe count** and **Scan status**. An empty sca
 does not erase saved devices. Scan failures are reported and retried with a
 bounded delay while known probes remain usable. Newly discovered devices extend
 the exact-topic subscriptions; no command wildcard is used.
+
+An out-of-range saved probe is marked offline individually, without restarting
+WiFi/MQTT or deleting its identity. No cached measurement is republished as new.
+Connection failures are warnings with the next retry delay. Retries continue
+indefinitely, backing off from `retry_min` (5 seconds by default) to `retry_max`
+(60 seconds). Other probes are serviced between bounded connection attempts;
+a failed attempt can delay them by up to `scan_timeout` (15 seconds by default).
+When the probe returns, a successful connection and fresh reading restore its
+online state automatically, without a reboot or manual scan. Detection is not
+instantaneous: an outage is discovered on the next read, and return is detected
+on a subsequent scheduled retry. Calibration recovery protections still apply;
+uncertain calibration writes are never replayed automatically.
 
 Identity uses the automatically discovered address plus address type, not the
 advertised name or probe type. Two identically named pH probes remain separate.
@@ -546,17 +559,31 @@ The Pico W's named `Pin("LED")` is used, not GPIO 25:
 
 | Pattern | Meaning |
 | --- | --- |
-| Fast single blink (100 ms on, 200 ms off) | Initializing at startup or reconnecting after an error |
+| Three quick flashes once (100 ms on/off), then steady on | Power-on entrypoint reached; application imports are loading |
+| Fast single blink (100 ms on, 200 ms off) | Runtime initializing |
+| Short single blink (100 ms on, 900 ms off) | Connecting to WiFi, including association and DHCP |
+| Mostly on (800 ms on, 200 ms off) | Synchronizing time with NTP |
+| Even blink (300 ms on/off) | Connecting or subscribing to MQTT |
+| Three quick flashes repeating (100 ms on/off, 900 ms final pause) | Scanning for Bluetooth probes |
+| Long-short pair (300 ms on, 100 ms off, 100 ms on, 900 ms off) | Connecting to a probe and discovering/subscribing to its BLE service |
 | Slow single blink (500 ms on, 1.5 s off) | WiFi, MQTT, BLE, probe, or bridge error; retry is pending |
-| Heartbeat double blink (100 ms on/off/on, then 1.2 s pause) | WiFi, MQTT, and BLE are connected and no error is active |
+| Heartbeat double blink (100 ms on/off/on, then 1.2 s pause) | Bridge service cycle healthy; automatic mode disconnects BLE between probes |
+| Three slower flashes repeating (200 ms on/off, then an extra 1.8 s pause) | Fatal startup/bridge exception; inspect USB traceback and reset after fixing |
 | Off | Normal stop or status LED disabled |
 
-The selected pattern repeats continuously. Startup and every reconnect use the
-fast pattern, errors use the slow pattern throughout retry backoff, and a
-successful transport connection starts the heartbeat. Calibration progress and
+Runtime patterns repeat continuously and identify the current connection stage.
+Errors use the slow pattern throughout retry backoff, and a successful service
+cycle starts the heartbeat. Calibration progress and
 operator-wait states retain the healthy heartbeat; calibration or transport
 failures switch to the error pattern. Ctrl-C/shutdown turns the LED off.
-Errors before the runtime/LED is initialized cannot be indicated this way.
+The boot flashes and fatal-error loop work before runtime initialization and
+are independent of `status_led`; that option disables runtime patterns only.
+They require the updated `main.py` to be stored on the board and executed.
+Running only `import reef_mqtt; reef_mqtt.main()` bypasses this boot wrapper.
+Errors before MicroPython executes `main.py` or initializes `Pin("LED")` still
+cannot be indicated. No light alone does not establish whether power is absent.
+NTP and MQTT use synchronous network calls: the LED can hold its current level
+while those calls block, then resume blinking when the event loop regains control.
 Since MQTT uses QoS 0, the heartbeat means that the bridge transports are healthy,
 not proof that Home Assistant processed the latest messages. Failed LED writes
 are logged without replaying an already published measurement.
@@ -575,8 +602,32 @@ OVERRIDES = {
 ```
 
 Changing only WiFi timeout/power-saving/LED options does not require reinstalling
-MicroPython or libraries. Deploy updated `reef_mqtt.py` and `pico_runtime.py`
-together, then restart the MicroPython backend.
+MicroPython or libraries. For these LED patterns and the registry memory fix,
+update [../reef_mqtt_multi.py](../reef_mqtt_multi.py) as `reef_mqtt_multi.py` and
+[pico_runtime.py](pico_runtime.py) as `pico_runtime.py` in the board root, then
+update [main.py](main.py) as `main.py` last. Keep the existing board `config.py`,
+`probes.json`, and all calibration markers. Restart the MicroPython interpreter
+or power-cycle; updating files on the computer does not update the board.
+
+### Startup memory failure
+
+`MemoryError: memory allocation failed, allocating 8193 bytes` from
+`Registry.load()` identifies the old `read(8193)` registry loader. It requests a
+large buffer even for a small saved inventory, before the normal LED starts.
+The updated loader checks the file size without reading it, collects unused
+heap, and parses with MicroPython's streaming `json.load()`. The 8192-byte file
+limit and saved identity/calibration safeguards remain in place; do not delete
+the registry or calibration markers as a workaround.
+
+This removes that particular allocation, not all possible memory exhaustion.
+If a fresh boot still fails, retain the full USB traceback. At an idle REPL,
+heap information can be collected without displaying credentials:
+
+```python
+import gc
+gc.collect()
+print("Heap free:", gc.mem_free(), "used:", gc.mem_alloc())
+```
 
 **Remaining limitations:** no board memory/radio/coexistence testing; 64 KiB is
 a rejection ceiling, not guaranteed available SRAM. NTP response I/O is bounded

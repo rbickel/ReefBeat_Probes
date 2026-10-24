@@ -24,6 +24,11 @@ WIFI_STATUS_NAMES = {
 }
 LED_PATTERNS = {
     "initializing": ((1, 0.1), (0, 0.2)),
+    "wifi_connecting": ((1, 0.1), (0, 0.9)),
+    "time_sync": ((1, 0.8), (0, 0.2)),
+    "mqtt_connecting": ((1, 0.3), (0, 0.3)),
+    "scanning": ((1, 0.1), (0, 0.1), (1, 0.1), (0, 0.1), (1, 0.1), (0, 0.9)),
+    "ble_connecting": ((1, 0.3), (0, 0.1), (1, 0.1), (0, 0.9)),
     "error": ((1, 0.5), (0, 1.5)),
     "ok": ((1, 0.1), (0, 0.1), (1, 0.1), (0, 1.2)),
 }
@@ -217,10 +222,13 @@ class Runtime:
             return
         if event in ("published", "ok", "calibrating", "waiting"):
             state = "ok"
-        elif event in ("initializing", "error"):
+        elif event in LED_PATTERNS:
             state = event
         else:
             raise ValueError("Unknown status LED event: " + event)
+        if (state == self._indicator_state and self._indicator_task is not None
+                and not self._indicator_task.done()):
+            return
         await self._stop_indicator()
         self._indicator_state = state
         pattern = LED_PATTERNS[state]
@@ -312,6 +320,7 @@ class Runtime:
             self._configure_wifi_power()
             self._log_wifi_ready()
             return
+        await self.indicate("wifi_connecting")
         self._wifi_ready_logged = False
         self._time_synced = False
         if self.publisher is not None:
@@ -363,6 +372,8 @@ class Runtime:
         cfg = self.settings
         await self._ensure_wifi()
         if not self._time_synced:
+            await self.indicate("time_sync")
+            await asyncio.sleep(0)
             if time.gmtime(0)[0] not in (1970, 2000):
                 raise ValueError("unsupported MicroPython RTC epoch")
             self.ntptime.host = cfg.ntp_host
@@ -371,6 +382,8 @@ class Runtime:
             self._time_synced = True
         self.timestamp()
         if self.publisher is None or not self.publisher.connected:
+            await self.indicate("mqtt_connecting")
+            await asyncio.sleep(0)
             if self.publisher is not None:
                 self.publisher.close()
             client = self.mqtt_factory(
@@ -399,6 +412,7 @@ class Runtime:
             self._check_mqtt()
 
     async def _connect_probe(self):
+        await self.indicate("ble_connecting")
         cfg = self.settings
         self._connect_stage = "BLE connection"
         self.device = self.aioble.Device(self._address_type, cfg.address)
@@ -447,6 +461,7 @@ class Runtime:
     async def scan_probes(self):
         if self.device is not None or self.connection is not None:
             raise ProbeError("Disconnect the active probe before Bluetooth scanning")
+        await self.indicate("scanning")
         found = {}
         limit_reported = False
         async with self.aioble.scan(

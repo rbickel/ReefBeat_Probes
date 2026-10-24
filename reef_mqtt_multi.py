@@ -3,6 +3,7 @@
 import asyncio
 import binascii
 import errno
+import gc
 import json
 import math
 import os
@@ -15,7 +16,7 @@ from reef_probe_profiles import (
     MODEL_NAMES, MEASUREMENTS, RAW_FIELDS, probe_description, probe_identity,
     measurement_messages, validate_profile,
 )
-from reef_probe_protocol import ProbeError, validate_telemetry
+from reef_probe_protocol import ProbeConnectionError, ProbeError, validate_telemetry
 
 
 class Registry:
@@ -26,15 +27,15 @@ class Registry:
 
     def load(self):
         try:
+            if os.stat(self.path)[6] > 8192:
+                raise ValueError("Probe registry exceeds its bounded size")
+            gc.collect()
             with open(self.path) as source:
-                raw = source.read(8193)
+                data = json.load(source)
         except OSError as error:
             if error.args and error.args[0] == errno.ENOENT:
                 return
             raise
-        if len(raw) > 8192:
-            raise ValueError("Probe registry exceeds its bounded size")
-        data = json.loads(raw)
         if (
             not isinstance(data, dict) or set(data) != {"version", "primary_ph", "probes"}
             or type(data["version"]) is not int or data["version"] != 1
@@ -363,9 +364,8 @@ class Supervisor:
         return None
 
     async def _indicate(self, event):
-        if self.indicator != event:
-            await indicate(self.runtime, event)
-            self.indicator = event
+        await indicate(self.runtime, event)
+        self.indicator = event
 
     async def _pin(self, blocker):
         if blocker is not None and self.pinned_id != blocker.id:
@@ -565,8 +565,16 @@ class Supervisor:
             if probe.calibration is None or not probe.calibration.inhibits_measurements:
                 await self._disconnect()
         except self.runtime.errors as error:
-            self.runtime.report("error", "Probe %s cycle failed; no cached replacement: %s" %
-                                (probe.id, describe_error(error)))
+            probe.retry_delay = (self.settings.retry_min if probe.retry_started is None
+                                 else min(self.settings.retry_max, probe.retry_delay * 2))
+            unavailable = isinstance(error, ProbeConnectionError)
+            self.runtime.report(
+                "warning" if unavailable else "error",
+                "Probe %s %s; retrying in %ss; no cached replacement: %s" % (
+                    probe.id, "unavailable" if unavailable else "cycle failed",
+                    probe.retry_delay, describe_error(error),
+                ),
+            )
             if probe.calibration is not None:
                 probe.calibration.transport_failed(probe.runtime, error, "multi-probe service " + probe.id)
             if self.runtime.mqtt_connected():
@@ -574,8 +582,6 @@ class Supervisor:
                 if probe.calibration is not None:
                     await probe.calibration.announce(probe.runtime)
                 await self._inventory()
-            probe.retry_delay = (self.settings.retry_min if probe.retry_started is None
-                                 else min(self.settings.retry_max, probe.retry_delay * 2))
             probe.retry_started = self.runtime.ticks()
             await self._disconnect()
             if not self.runtime.mqtt_connected():
