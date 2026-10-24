@@ -364,6 +364,28 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(starts), 2)
             self.assertEqual(starts[1] - starts[0], 300)
 
+    async def test_five_ph_probes_poll_repeatedly_without_external_io(self):
+        descriptions = [probe_description("02:00:00:00:00:%02X" % number, 0,
+                                          "RS_PH-SIM%02d" % number)
+                        for number in range(1, 6)]
+        self.settings.address = descriptions[0]["address"]
+        self.settings.poll_interval = 5
+        runtime = self.runtime(descriptions)
+        runtime.stop_at = 150
+        with patch.object(runtime, "close", wraps=runtime.close) as close:
+            await run_bridge(self.settings, runtime, self.stop)
+        self.assertEqual(close.await_count, 1)
+        for item in descriptions:
+            topic = self.settings.probe_topic_prefix + "/" + item["id"] + "/ph/state"
+            self.assertEqual(len(self.values(runtime, topic)), 30)
+            self.assertEqual(self.values(runtime, topic), [PH_DATA["value"]] * 30)
+        self.assertEqual(runtime.scans, 1)
+        self.assertEqual(len(runtime.subscriptions), 13)
+        self.assertFalse(any(method == POST for _, _, _, method, _ in runtime.requests))
+        registry = Registry(self.settings.probe_registry_path, 8)
+        registry.load()
+        self.assertEqual(len(registry.probes), 5)
+
     async def test_manual_scan_and_read_now_route_to_the_selected_probe(self):
         runtime = self.runtime([PH_A])
         sent = False
